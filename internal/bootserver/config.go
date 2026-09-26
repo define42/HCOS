@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -18,6 +19,7 @@ import (
 // Config contains only local inputs. No boot request causes an outbound request.
 type Config struct {
 	Listen    string         `json:"listen"`
+	PXEHTTP   bool           `json:"pxe_http,omitempty"`
 	TLSCert   string         `json:"tls_cert,omitempty"`
 	TLSKey    string         `json:"tls_key,omitempty"`
 	ImagesDir string         `json:"images_dir"`
@@ -79,6 +81,23 @@ func (c Config) Validate() error {
 		host, _, err := net.SplitHostPort(c.Listen)
 		if err != nil || host == "" || !isLoopback(host) {
 			return errors.New("TLS is required except when listening on loopback")
+		}
+	}
+	if c.PXEHTTP {
+		if c.TLSCert == "" {
+			return errors.New("pxe_http requires TLS on the main listener")
+		}
+		host, port, err := net.SplitHostPort(c.Listen)
+		if err != nil {
+			return errors.New("pxe_http requires listen to contain an IPv4 address and port")
+		}
+		ip, err := netip.ParseAddr(host)
+		if err != nil || !ip.Is4() || ip.IsUnspecified() || ip.IsMulticast() ||
+			ip == netip.AddrFrom4([4]byte{255, 255, 255, 255}) {
+			return errors.New("pxe_http requires a specific unicast IPv4 listen address")
+		}
+		if port == "80" {
+			return errors.New("pxe_http reserves port 80; use a different port for the TLS listener")
 		}
 	}
 	for name, path := range map[string]string{

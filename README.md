@@ -18,7 +18,7 @@ make smoke                # Boot the generic base EFI in OVMF/QEMU.
 make smoke-injected       # Boot an EFI with a sample agent and CA.
 make smoke-server         # Build an EFI through the Go boot server and boot it.
 make smoke-control-plane  # Exercise the real controller and agent with a fake virsh.
-make smoke-pxe            # Exercise fixed-port controller PXE in an isolated network namespace.
+make smoke-pxe            # Exercise TFTP scripts and direct HTTP/HTTPS boot in an isolated network namespace.
 ```
 
 The EFI smoke tests need host `qemu-system-x86_64` and OVMF firmware. The injected, server, and PXE tests also need OpenSSL. These EFI tests use software emulation, so host KVM is not required. `make smoke-pxe` uses `sudo -n`, `unshare`, and `ip` to bind privileged ports in an isolated network namespace; its user needs passwordless sudo for that command. Run `make build` and `make components` before `make smoke-server`; `make smoke-control-plane` builds the Go components itself. Set both `OVMF_CODE` and `OVMF_VARS` to override firmware discovery. The default EFI test allows 300 seconds and 2 GiB guest RAM. Serial and QEMU logs are kept under `build/`.
@@ -59,7 +59,7 @@ image="ghcr.io/define42/hcos:sha-$commit"
 docker pull "$image"
 
 docker run -d --name hcos-server --restart unless-stopped \
-  -p 8443:8443 \
+  --network host \
   --mount type=bind,src=/etc/hcos-server,dst=/etc/hcos-server,readonly \
   --mount type=bind,src=/var/lib/hcos/trust,dst=/var/lib/hcos/trust,readonly \
   --mount type=bind,src=/var/lib/hcos/cache,dst=/var/lib/hcos/cache \
@@ -73,7 +73,7 @@ docker run -d --name hcos-controller --restart unless-stopped \
   "$image" --config /etc/hcos-controller/config.json
 ```
 
-The controller uses host networking for PXE so it can bind the provisioning interface and serve DHCP, TFTP, and HTTP. Run it with a rootful Docker engine and the network capabilities needed to bind its configured ports and interface. Keep `/var/lib/hcos-controller` and `/var/lib/hcos/cache` private and writable by their respective processes. For Secure Boot signing, set `signing.command` to `/usr/bin/sbsign` and mount the key and certificate read-only.
+Both containers use host networking: the controller binds the provisioning interface for DHCP and TFTP; the boot server binds the same IP for HTTP on port 80 and HTTPS on port 8443. Enable `pxe_http` in the boot-server config below. Run them with a rootful Docker engine and the network capabilities needed to bind their configured ports and interface. Keep `/var/lib/hcos-controller` and `/var/lib/hcos/cache` private and writable by their respective processes. For Secure Boot signing, set `signing.command` to `/usr/bin/sbsign` and mount the key and certificate read-only.
 
 To check a local image built from the current checkout, build the six release artifacts first, then compare every packaged file byte for byte against `dist/`:
 
@@ -119,7 +119,8 @@ The boot server reads `/etc/hcos-server/server.json` by default. All configured 
 
 ```json
 {
-  "listen": "0.0.0.0:8443",
+  "listen": "192.168.50.2:8443",
+  "pxe_http": true,
   "tls_cert": "/etc/hcos-server/boot.crt",
   "tls_key": "/etc/hcos-server/boot.key",
   "images_dir": "/var/lib/hcos/images",
@@ -171,7 +172,9 @@ The controller reads `/etc/hcos-controller/config.json` by default. Its `state_d
 }
 ```
 
-Run the two services with `dist/hcos-server --config /etc/hcos-server/server.json` and `dist/hcos-controller --config /etc/hcos-controller/config.json`. Both expose `GET /healthz` and `GET /readyz`. The controller API and boot server require TLS on non-loopback listeners; the optional PXE listener described below serves HTTP on the configured controller IP. The controller API always listens on `server_ip:9443`. The boot server must be reachable on the same IP at port 8443 when PXE fallback is enabled. Both HTTPS certificates need an IP address subject alternative name matching `server_ip`. The boot server also accepts `HEAD` for these endpoints and for the EFI endpoint.
+Set `pxe_http` to `true` to enable HTTP on port 80 at the IP in `listen`. The HTTPS and HTTP listeners share the same node/token authorization, EFI generation, and cache. This option requires TLS on the main listener and a specific IPv4 address; omit it for HTTPS-only boot. Use the same IP as the controller's `server_ip`.
+
+Run the two services with `dist/hcos-server --config /etc/hcos-server/server.json` and `dist/hcos-controller --config /etc/hcos-controller/config.json`. Both expose `GET /healthz` and `GET /readyz`. The controller API listens on `server_ip:9443` and requires TLS outside loopback. The boot server serves HTTPS on port 8443 and, with `pxe_http` enabled, HTTP on port 80. Both HTTPS certificates need an IP address subject alternative name matching the address used by their clients. The boot server also accepts `HEAD` for these endpoints and for the EFI endpoint.
 
 A node boots from `https://192.168.50.2:8443/boot/hcos.efi?node=compute-01&token=<BOOT_TOKEN>` (also available at `/hcos.efi`). The boot token is a secret carried in the URL; protect firmware configuration and any proxy access logs that contain it. Firmware must already trust the boot server's HTTPS certificate. The injected `root-ca.crt` is installed only after download and must validate the controller's HTTPS certificate. No private CA key belongs in the image.
 
@@ -195,12 +198,22 @@ The controller can also boot x86_64 UEFI machines whose firmware supports PXE ov
 The boot path is:
 
 ```text
-UEFI PXE -> DHCP -> TFTP bootx64.efi (iPXE) -> HTTP /boot/boot.ipxe
-         -> HTTP /boot/hcos.efi -> controller HTTPS fetch from hcos-server
+UEFI PXE -> DHCP -> TFTP bootx64.efi (iPXE)
+         -> TFTP boot.ipxe (node ID and boot token)
+         -> HTTP hcos-server:80/boot/hcos.efi?node=<ID>&token=<BOOT_TOKEN>
          -> personalized HCOS EFI
 ```
 
-Only the small iPXE loader travels over TFTP. The controller serves the boot script and streams the personalized EFI over HTTP; it obtains the EFI from the existing boot server over verified HTTPS. Neither the boot token nor the boot server URL is sent in the iPXE script. The controller maps the HTTP client's source IP against its configured static IP-to-node table, then sends that node's boot token to the boot server; it does not verify that the client previously completed a DHCP lease exchange. The EFI still contains that node's controller credential, and PXE, TFTP, DHCP, and the controller's provisioning HTTP endpoint do not authenticate the machine. A client able to spoof a configured MAC or IP, or observe provisioning HTTP traffic, can obtain a node image. Use this fallback only on a physically or otherwise isolated lab network.
+The controller serves the embedded iPXE loader and generates `boot.ipxe` for the requesting client's configured static IP. The script contains:
+
+```ipxe
+#!ipxe
+chain http://192.168.50.2/boot/hcos.efi?node=compute-01&token=<BOOT_TOKEN>
+```
+
+Node IDs and tokens are URL-encoded. Unknown source IPs cannot retrieve a personalized script. The boot server checks the node and token, then serves the EFI directly over HTTP; the controller no longer fetches or proxies the EFI. HTTPS on port 8443 remains available for direct UEFI HTTPS Boot.
+
+The source IP is matched against the configured DHCP lease table; this does not verify that the client completed a DHCP exchange. The boot token travels in the TFTP script and HTTP URL, and the EFI contains the node's controller credential. A client able to spoof a configured MAC or IP, or observe provisioning traffic, can obtain those credentials. Keep this fallback on an isolated provisioning network and avoid logging request query strings.
 
 Build the unsigned x64 UEFI iPXE loader before compiling the controller. The iPXE build refreshes the loader embedded in the Go package:
 
@@ -209,9 +222,11 @@ make ipxe
 make components
 ```
 
-The build downloads a pinned iPXE source revision, embeds `dhcp` followed by `chain http://${next-server}/boot/boot.ipxe`, and writes its corresponding source archive to `dist/ipxe-source.tar.gz` plus provenance and license metadata under `dist/ipxe/`. Run `make smoke-pxe` after `make ipxe` and `make components` to check the fixed-port controller listeners with the built loader in an isolated network namespace. To rebuild from a local source checkout without network access, set `IPXE_SOURCE=/path/to/ipxe` to a checkout containing the pinned commit. The ordinary HCOS PXE path uses HTTP only between iPXE and the controller; the controller fetches each EFI from `https://<server_ip>:8443` and verifies the boot server's certificate using `boot_ca_file`.
+The build downloads a pinned iPXE source revision and embeds `dhcp` followed by `chain tftp://${next-server}/boot.ipxe`. It writes the corresponding source archive to `dist/ipxe-source.tar.gz` and provenance and license metadata under `dist/ipxe/`. Run `make smoke-pxe` after `make ipxe` to exercise both real services, per-node TFTP scripts, and authenticated HTTP/HTTPS EFI downloads. To rebuild offline, set `IPXE_SOURCE=/path/to/ipxe` to a checkout containing the pinned commit.
 
-Remove `tftp.loader_path` from existing controller configs; the loader is now part of `hcos-controller` and that old key is rejected. Set the top-level `server_ip` once, remove the old top-level `listen_address` and nested PXE listener, DHCP server, and next-server addresses, remove the old `pxe.boot_server_url`, then add `pxe` to the controller JSON. The parser rejects the removed keys. This complete example uses one node and omits `router` and `dns` so the provisioning network has no advertised gateway or resolver. The boot token must be the **same value** as `boot_token` for this node in the boot server's `nodes.json`, and must differ from its controller agent token. Generate each token separately with `openssl rand -hex 32` and store this file with mode `0600`.
+For existing installations, rebuild the iPXE loader and controller, enable `pxe_http` in the boot-server config, and remove `pxe.boot_ca_file` and the optional `pxe.tftp` object (including `script_path` or the older `loader_path`). The controller derives its addresses from top-level `server_ip`; the old listener, DHCP server/next-server, and `boot_server_url` settings are also rejected. If configured explicitly, update `ipxe_boot_file` to `tftp://<server_ip>/boot.ipxe`; leaving it unset uses that default. The controller no longer listens on port 80, and `/boot/boot.ipxe` is now obtained as a TFTP file rather than an HTTP endpoint.
+
+This complete example uses one node and omits `router` and `dns` so the provisioning network has no advertised gateway or resolver. The boot token must be the **same value** as `boot_token` for this node in the boot server's `nodes.json`, and must differ from its controller agent token. Generate each token separately with `openssl rand -hex 32` and store this file with mode `0600`.
 
 ```json
 {
@@ -225,7 +240,6 @@ Remove `tftp.loader_path` from existing controller configs; the loader is now pa
     "token": "REPLACE_WITH_RANDOM_NODE_TOKEN_AT_LEAST_32_CHARS"
   }],
   "pxe": {
-    "boot_ca_file": "/etc/hcos-controller/boot-root-ca.crt",
     "boot_tokens": {
       "compute-01": "REPLACE_WITH_RANDOM_BOOT_TOKEN_AT_LEAST_32_CHARS"
     },
@@ -242,7 +256,7 @@ Remove `tftp.loader_path` from existing controller configs; the loader is now pa
 }
 ```
 
-The controller's DHCP service binds `0.0.0.0:67` internally on `eno2` to receive broadcasts and answers only that MAC. The configured `server_ip` is advertised as the DHCP server and next server. It advertises `bootx64.efi` for UEFI architecture codes 7 and 9; iPXE clients receive the controller's HTTP script URL. TFTP serves the embedded `bootx64.efi` and, if `tftp.script_path` is configured, a small `boot.ipxe`; it never serves personalized EFIs. The controller's PXE HTTP service listens on `server_ip:80` and serves only `/boot/boot.ipxe` and `/boot/hcos.efi`; TFTP listens on `server_ip:69`. Permit UDP 67 and 69, TFTP's ephemeral transfer ports, and TCP 80, 8443, and 9443 on the isolated interface as needed. Binding DHCP and TFTP to privileged ports normally requires root or appropriate capabilities.
+The controller's DHCP service binds `0.0.0.0:67` internally on `eno2` to receive broadcasts and answers only that MAC. It advertises `server_ip` as the DHCP and TFTP server, `bootx64.efi` for UEFI architecture codes 7 and 9, and `tftp://<server_ip>/boot.ipxe` for iPXE clients. TFTP on `server_ip:69` serves the embedded loader and personalized script (`boot.ipxe`, also accepted as `boot/boot.ipxe`); it never serves EFI payloads. Permit UDP 67 and 69, TFTP's ephemeral transfer ports, and TCP 80, 8443, and 9443 as needed on the isolated interface. Binding the privileged ports normally requires root or appropriate capabilities.
 
 The embedded loader is unsigned. Secure Boot requires embedding a loader signed by a key trusted by the firmware, then rebuilding the controller. Signing only the personalized HCOS EFI does not authorize the preceding iPXE loader. The fallback supports x64 UEFI PXE; it does not add legacy BIOS boot support.
 

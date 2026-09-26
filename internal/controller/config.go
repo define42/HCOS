@@ -52,6 +52,10 @@ func (c Config) RuntimePXE() *PXEConfig {
 	pxe.DHCP.ServerIP = c.ServerIP
 	pxe.DHCP.NextServerIP = c.ServerIP
 	pxe.TFTP.ListenAddress = net.JoinHostPort(c.ServerIP, pxeTFTPPort)
+	pxe.TFTP.scripts = make(map[string][]byte, len(pxe.DHCP.Leases))
+	for _, lease := range pxe.DHCP.Leases {
+		pxe.TFTP.scripts[lease.IP] = pxeBootScript(c.ServerIP, lease.NodeID, pxe.BootTokens[lease.NodeID])
+	}
 	return &pxe
 }
 

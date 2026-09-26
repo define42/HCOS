@@ -6,9 +6,11 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -104,7 +106,7 @@ func TestTFTPRejectsOtherPathsWritesAndModes(t *testing.T) {
 	}{
 		{"traversal", tftpRequestPacket(1, "../bootx64.efi", "octet"), 1},
 		{"unknown", tftpRequestPacket(1, "secret.txt", "octet"), 1},
-		{"missing script", tftpRequestPacket(1, "boot.ipxe", "octet"), 1},
+		{"missing script", tftpRequestPacket(1, "boot.ipxe", "octet"), 2},
 		{"write", tftpRequestPacket(2, "bootx64.efi", "octet"), 2},
 		{"netascii", tftpRequestPacket(1, "bootx64.efi", "netascii"), 4},
 		{"invalid blksize", tftpRequestPacket(1, "bootx64.efi", "octet", "blksize", "7"), 8},
@@ -204,7 +206,12 @@ func startTFTPTestServer(t *testing.T, loader, script []byte) *net.UDPAddr {
 
 func newTFTPClient(t *testing.T) *net.UDPConn {
 	t.Helper()
-	client, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	return newTFTPClientAt(t, "127.0.0.1")
+}
+
+func newTFTPClientAt(t *testing.T, ip string) *net.UDPConn {
+	t.Helper()
+	client, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(ip)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,7 +255,12 @@ func readTFTPPacket(t *testing.T, client *net.UDPConn) ([]byte, *net.UDPAddr) {
 
 func fetchTFTP(t *testing.T, address *net.UDPAddr, name string, blockSize int, withTsize bool) []byte {
 	t.Helper()
-	client := newTFTPClient(t)
+	return fetchTFTPFrom(t, address, name, blockSize, withTsize, "127.0.0.1")
+}
+
+func fetchTFTPFrom(t *testing.T, address *net.UDPAddr, name string, blockSize int, withTsize bool, sourceIP string) []byte {
+	t.Helper()
+	client := newTFTPClientAt(t, sourceIP)
 	options := []string{"blksize", strconv.Itoa(blockSize)}
 	if withTsize {
 		options = append(options, "tsize", "0")
@@ -282,5 +294,110 @@ func fetchTFTP(t *testing.T, address *net.UDPAddr, name string, blockSize int, w
 		if len(packet)-4 < blockSize {
 			return result
 		}
+	}
+}
+
+func TestTFTPServesOnlyRequestingNodesScript(t *testing.T) {
+	config := testConfig(t)
+	pxe := testPXEConfig(t, "http://127.0.0.1:8080")
+	pxe.DHCP.Leases = append(pxe.DHCP.Leases, DHCPLease{
+		NodeID: "compute-02", MAC: "52:54:00:12:34:57", IP: "127.0.0.3",
+	})
+	const special = "?+$;${variable}/=#%"
+	pxe.BootTokens["compute-02"] = strings.Repeat("&", 512-len(special)) + special
+	config.PXE = &pxe
+	server, err := NewTFTPServer(config.RuntimePXE().TFTP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	address, done, cancel := runTFTPTestServer(t, server)
+	t.Cleanup(func() {
+		cancel()
+		awaitTFTPShutdown(t, done)
+	})
+	for _, tc := range []struct{ ip, node, path string }{
+		{"127.0.0.2", "compute-01", "boot.ipxe"},
+		{"127.0.0.3", "compute-02", "boot/boot.ipxe"},
+	} {
+		script := string(fetchTFTPFrom(t, address, tc.path, 512, false, tc.ip))
+		if !strings.HasPrefix(script, "#!ipxe\nchain ") || strings.Count(script, "\n") != 2 {
+			t.Fatalf("script contains unexpected commands: %q", script)
+		}
+		target, err := url.Parse(strings.TrimSuffix(strings.TrimPrefix(script, "#!ipxe\nchain "), "\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if target.Scheme != "http" || target.Host != config.ServerIP || target.Path != "/boot/hcos.efi" || target.Fragment != "" || target.Query().Get("node") != tc.node || target.Query().Get("token") != pxe.BootTokens[tc.node] || len(target.Query()) != 2 {
+			t.Fatal("script did not preserve the requesting node's URL and credentials")
+		}
+		if tc.node == "compute-02" && len(script) <= 1024 {
+			t.Fatal("maximum encoded token did not exercise multiple transfer blocks")
+		}
+		if strings.Contains(script, "${") || strings.Contains(script, ";") {
+			t.Fatal("unescaped iPXE syntax in generated script")
+		}
+	}
+	unknown := newTFTPClientAt(t, "127.0.0.4")
+	if _, err := unknown.WriteToUDP(tftpRequestPacket(1, "boot.ipxe", "octet"), address); err != nil {
+		t.Fatal(err)
+	}
+	packet, _ := readTFTPPacket(t, unknown)
+	if binary.BigEndian.Uint16(packet[:2]) != tftpERROR || binary.BigEndian.Uint16(packet[2:4]) != 2 {
+		t.Fatal("unknown source IP was not denied a node script")
+	}
+	// Firmware can fetch the public loader before receiving its DHCP lease.
+	loader := fetchTFTPFrom(t, address, "bootx64.efi", 1024, false, "127.0.0.4")
+	if !bytes.Equal(loader, embeddedIPXELoader) {
+		t.Fatal("unknown source could not download the public loader")
+	}
+}
+
+func TestTFTPCancelClosesPendingScriptTransfer(t *testing.T) {
+	server, err := NewTFTPServer(TFTPConfig{
+		ListenAddress: "127.0.0.1:1069",
+		scripts:       map[string][]byte{"127.0.0.2": pxeBootScript("127.0.0.1", "compute-01", testPXEBootToken)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	address, done, cancel := runTFTPTestServer(t, server)
+	t.Cleanup(cancel)
+	client := newTFTPClientAt(t, "127.0.0.2")
+	if _, err := client.WriteToUDP(tftpRequestPacket(1, "boot.ipxe", "octet"), address); err != nil {
+		t.Fatal(err)
+	}
+	packet, _ := readTFTPPacket(t, client)
+	if binary.BigEndian.Uint16(packet[:2]) != tftpDATA {
+		t.Fatal("expected a pending script transfer")
+	}
+	// Do not acknowledge DATA: cancellation must stop the ACK wait.
+	cancel()
+	awaitTFTPShutdown(t, done)
+	if len(server.sessions) != 0 {
+		t.Fatal("script transfer survived server shutdown")
+	}
+}
+
+func runTFTPTestServer(t *testing.T, server *TFTPServer) (*net.UDPAddr, <-chan error, context.CancelFunc) {
+	t.Helper()
+	listener, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx, listener) }()
+	return listener.LocalAddr().(*net.UDPAddr), done, cancel
+}
+
+func awaitTFTPShutdown(t *testing.T, done <-chan error) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("TFTP shutdown: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Error("TFTP server did not stop after cancellation")
 	}
 }

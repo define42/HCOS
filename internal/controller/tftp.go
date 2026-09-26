@@ -42,6 +42,7 @@ const (
 type TFTPConfig struct {
 	ListenAddress string `json:"-"`
 	ScriptPath    string `json:"script_path,omitempty"`
+	scripts       map[string][]byte
 }
 
 // Validate rejects invalid listener and script paths before the UDP port opens.
@@ -54,6 +55,11 @@ func (c TFTPConfig) Validate() error {
 	if err != nil || portNumber < 1 || portNumber > 65535 {
 		return errors.New("TFTP listen_address must use a UDP port from 1 to 65535")
 	}
+	for ip, script := range c.scripts {
+		if net.ParseIP(ip).To4() == nil || len(script) == 0 || len(script) > tftpMaxScriptBytes {
+			return errors.New("TFTP scripts require an IPv4 client and 1 to 65536 bytes")
+		}
+	}
 	if c.ScriptPath != "" && !cleanAbsolutePath(c.ScriptPath) {
 		return errors.New("TFTP script_path must be a clean absolute file path")
 	}
@@ -64,7 +70,7 @@ func cleanAbsolutePath(path string) bool {
 	return filepath.IsAbs(path) && filepath.Clean(path) == path && path != string(filepath.Separator)
 }
 
-// TFTPServer serves a small, fixed set of public boot assets over UDP.
+// TFTPServer serves the public iPXE loader and node-specific scripts over UDP.
 // Serve owns each transfer socket; the caller owns the initial UDP listener.
 type TFTPServer struct {
 	config   TFTPConfig
@@ -86,11 +92,17 @@ func NewTFTPServer(config TFTPConfig) (*TFTPServer, error) {
 			return nil, fmt.Errorf("TFTP script: %w", err)
 		}
 	}
+	scripts := make(map[string][]byte, len(config.scripts))
+	for ip, script := range config.scripts {
+		scripts[ip] = bytes.Clone(script)
+	}
+	config.scripts = scripts
 	return &TFTPServer{config: config, loader: embeddedIPXELoader, sessions: make(chan struct{}, tftpMaxSessions)}, nil
 }
 
-// Serve accepts only read requests for bootx64.efi and, when configured,
-// boot.ipxe. Cancelling ctx closes active transfer sockets and waits for them.
+// Serve accepts reads for bootx64.efi and configured boot.ipxe scripts.
+// Generated scripts require a matching source IP. Cancelling ctx closes active
+// transfer sockets and waits for them.
 func (s *TFTPServer) Serve(ctx context.Context, conn *net.UDPConn) error {
 	if s == nil || conn == nil {
 		return errors.New("TFTP server and listener are required")
@@ -122,9 +134,18 @@ func (s *TFTPServer) Serve(ctx context.Context, conn *net.UDPConn) error {
 			writeTFTPError(conn, peer, code, message)
 			continue
 		}
-		if request.filename != "bootx64.efi" && (request.filename != "boot.ipxe" || s.config.ScriptPath == "") {
+		isScript := request.filename == "boot.ipxe" || request.filename == "boot/boot.ipxe"
+		if request.filename != "bootx64.efi" && !isScript {
 			writeTFTPError(conn, peer, 1, "file not found")
 			continue
+		}
+		var script []byte
+		if isScript {
+			script = s.config.scripts[peer.IP.String()]
+			if script == nil && (len(s.config.scripts) != 0 || s.config.ScriptPath == "") {
+				writeTFTPError(conn, peer, 2, "access denied")
+				continue
+			}
 		}
 		select {
 		case s.sessions <- struct{}{}:
@@ -138,6 +159,9 @@ func (s *TFTPServer) Serve(ctx context.Context, conn *net.UDPConn) error {
 		if request.filename == "bootx64.efi" {
 			asset = bytes.NewReader(s.loader)
 			size = int64(len(s.loader))
+		} else if script != nil {
+			asset = bytes.NewReader(script)
+			size = int64(len(script))
 		} else {
 			var err error
 			file, size, err = openTFTPAsset(s.config.ScriptPath, tftpMaxScriptBytes)

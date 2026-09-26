@@ -16,7 +16,7 @@ func testDHCPConfig() DHCPConfig {
 		Router:        "192.0.2.1",
 		DNS:           []string{"192.0.2.53"},
 		BootFile:      "bootx64.efi",
-		IPXEBootFile:  "http://192.0.2.1/boot/boot.ipxe",
+		IPXEBootFile:  tftpScriptURL("192.0.2.1"),
 		Leases: []DHCPLease{{
 			NodeID: "compute-01", MAC: "52:54:00:12:34:56", IP: "192.0.2.100",
 		}},
@@ -100,8 +100,8 @@ func TestDHCPIpXESecondStageDoesNotLoop(t *testing.T) {
 				t.Fatal("expected DHCP reply for known iPXE machine")
 			}
 			got := string(testDHCPOptions(t, reply.Packet)[67])
-			if got != "http://192.0.2.1/boot/boot.ipxe" {
-				t.Fatalf("iPXE should fetch HTTP script, got %q", got)
+			if got != "tftp://192.0.2.1/boot.ipxe" {
+				t.Fatalf("iPXE should fetch TFTP script, got %q", got)
 			}
 		})
 	}
@@ -198,7 +198,9 @@ func TestDHCPConfigRejectsUnsafeScope(t *testing.T) {
 			c.Leases = append(c.Leases, DHCPLease{NodeID: c.Leases[0].NodeID, MAC: "52:54:00:12:34:57", IP: "192.0.2.101"})
 		}},
 		{"TFTP traversal", func(c *DHCPConfig) { c.BootFile = "../bootx64.efi" }},
-		{"non-HTTP iPXE target", func(c *DHCPConfig) { c.IPXEBootFile = "tftp://192.0.2.1/bootx64.efi" }},
+		{"unsupported iPXE URL scheme", func(c *DHCPConfig) { c.IPXEBootFile = "ftp://192.0.2.1/boot.ipxe" }},
+		{"TFTP URL credentials", func(c *DHCPConfig) { c.IPXEBootFile = "tftp://user@192.0.2.1/boot.ipxe" }},
+		{"TFTP URL fragment", func(c *DHCPConfig) { c.IPXEBootFile = "tftp://192.0.2.1/boot.ipxe#script" }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

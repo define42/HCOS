@@ -249,7 +249,7 @@ func dhcpUsableInSubnet(ip, server, mask [4]byte) bool {
 	return !allHostZero && !allHostOne
 }
 
-func dhcpBootFile(value string, httpURL bool) error {
+func dhcpBootFile(value string, bootURL bool) error {
 	if value == "" || len(value) > 127 || strings.ContainsAny(value, "\x00\r\n\\") {
 		return errors.New("must be 1 to 127 bytes without control characters or backslashes")
 	}
@@ -258,13 +258,13 @@ func dhcpBootFile(value string, httpURL bool) error {
 			return errors.New("must contain printable ASCII without spaces")
 		}
 	}
-	if httpURL {
-		if !strings.HasPrefix(value, "http://") && !strings.HasPrefix(value, "https://") {
-			return errors.New("must be an HTTP or HTTPS URL")
+	if bootURL {
+		if !strings.HasPrefix(value, "http://") && !strings.HasPrefix(value, "https://") && !strings.HasPrefix(value, "tftp://") {
+			return errors.New("must be an HTTP, HTTPS, or TFTP URL")
 		}
 		parsed, err := neturlParse(value)
 		if err != nil || parsed == "" {
-			return errors.New("must be an absolute HTTP or HTTPS URL without credentials or a fragment")
+			return errors.New("must be an absolute HTTP, HTTPS, or TFTP URL without credentials or a fragment")
 		}
 		return nil
 	}
@@ -280,7 +280,7 @@ func neturlParse(value string) (string, error) {
 	if err != nil || parsed.Hostname() == "" || parsed.User != nil || parsed.Fragment != "" || parsed.Opaque != "" {
 		return "", errors.New("invalid boot URL")
 	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+	if parsed.Scheme != "http" && parsed.Scheme != "https" && parsed.Scheme != "tftp" {
 		return "", errors.New("invalid boot URL scheme")
 	}
 	return parsed.Hostname(), nil

@@ -12,9 +12,9 @@ Usage: scripts/build-ipxe.sh
 
 Build dist/bootx64.efi from a pinned iPXE source revision and copy it into the
 controller package so Go embeds the exact loader served over TFTP. The iPXE script
-obtains DHCP settings, then requests http://${next-server}/boot/boot.ipxe.
+obtains DHCP settings, then requests tftp://${next-server}/boot.ipxe for its node boot URL.
 The loader, source revision, bootstrap script, and upstream license notices are
-written below dist/. Only the small loader is transferred by TFTP.
+written below dist/. The loader and node script are transferred by TFTP.
 
 Environment:
   IPXE_SOURCE   Existing local iPXE Git checkout containing the pinned commit.
@@ -93,7 +93,7 @@ export SOURCE_DATE_EPOCH
 cat > "$source_dir/src/hcos-bootstrap.ipxe" <<'SCRIPT'
 #!ipxe
 dhcp
-chain http://${next-server}/boot/boot.ipxe
+chain tftp://${next-server}/boot.ipxe
 SCRIPT
 
 make_args=("bin-x86_64-efi/ipxe-legacy.efi" "EMBED=hcos-bootstrap.ipxe" "DEBUG=")
