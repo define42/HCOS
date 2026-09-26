@@ -128,6 +128,16 @@ jobs:
         if: ${{ hashFiles('scripts/build-ipxe.sh') != '' }}
         run: make smoke-pxe
 
+      - name: Verify HCOS container image
+        if: ${{ hashFiles('Dockerfile.release') != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit_sha="$(git rev-parse HEAD)"
+          docker build --platform linux/amd64 --file Dockerfile.release \
+            --build-arg "HCOS_COMMIT_SHA=${commit_sha}" --tag hcos:ci .
+          scripts/verify-container.sh hcos:ci "$commit_sha"
+
       - name: Upload build files
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -150,6 +160,7 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: write
+      packages: write
     strategy:
       fail-fast: false
       max-parallel: 4
@@ -216,6 +227,32 @@ jobs:
         if: ${{ hashFiles('scripts/build-ipxe.sh') != '' }}
         run: make smoke-pxe
 
+      - name: Publish commit container image
+        if: ${{ hashFiles('Dockerfile.release') != '' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ matrix.commit }}
+        run: |
+          set -euo pipefail
+          repo_lower="$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/${repo_lower}:sha-${COMMIT_SHA}"
+
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          if docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
+            echo "Keeping existing commit image $image."
+            exit 0
+          fi
+
+          docker build --platform linux/amd64 --pull --file Dockerfile.release \
+            --build-arg "HCOS_COMMIT_SHA=${COMMIT_SHA}" \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${COMMIT_SHA}" \
+            --tag "$image" .
+          scripts/verify-container.sh "$image" "$COMMIT_SHA"
+          docker push "$image"
+          docker buildx imagetools inspect "$image"
+
       - name: Publish immutable GitHub release asset
         shell: bash
         env:
@@ -253,8 +290,12 @@ jobs:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.select_main_commits.result == 'success' && needs.build_main_commits.result == 'success' }}
     needs: [select_main_commits, build_main_commits]
     runs-on: ubuntu-24.04
+    concurrency:
+      group: hcos-main-latest
+      queue: max
     permissions:
       contents: write
+      packages: write
     steps:
       - name: Mark the current main tip as latest
         shell: bash
@@ -275,5 +316,12 @@ jobs:
             echo "::error::Release $tag has no hcos-base.efi asset." >&2
             exit 1
           fi
+
+          repo_lower="$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          image="ghcr.io/${repo_lower}"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker buildx imagetools inspect "${image}:sha-${PUSH_TIP}" >/dev/null
+          docker buildx imagetools create --prefer-index=false \
+            --tag "${image}:latest" "${image}:sha-${PUSH_TIP}"
 
           gh release edit "$tag" --latest --repo "$GITHUB_REPOSITORY"

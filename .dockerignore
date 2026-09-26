@@ -1,0 +1,12 @@
+# The root Dockerfile builds the EFI from a read-only bind mount. Its build
+# context only needs the Dockerfile; the release Dockerfile needs these outputs.
+*
+!Dockerfile
+!Dockerfile.release
+!dist/
+!dist/hcos-base.efi
+!dist/hcos-controller
+!dist/hcos-server
+!dist/hcos-agent
+!dist/bootx64.efi
+!dist/ipxe-source.tar.gz

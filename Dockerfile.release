@@ -1,0 +1,50 @@
+# Build the release image only after `make build components ipxe` has produced
+# the matching artifacts. The existing Dockerfile remains the EFI build tool.
+FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+
+ARG HCOS_COMMIT_SHA
+ARG TARGETPLATFORM
+
+# The controller needs CA roots to verify the bootserver. The bootserver can
+# optionally use sbsign to sign each personalized EFI after injection.
+RUN set -eu; \
+    test "$TARGETPLATFORM" = linux/amd64; \
+    test "${#HCOS_COMMIT_SHA}" -eq 40; \
+    case "$HCOS_COMMIT_SHA" in *[!0-9a-f]*|'') exit 1;; esac; \
+    apk add --no-cache ca-certificates-bundle sbsigntool; \
+    mkdir -p /etc/hcos-controller /etc/hcos-server \
+        /var/lib/hcos/cache /var/lib/hcos/trust /var/lib/hcos-controller; \
+    chmod 0700 /var/lib/hcos/cache /var/lib/hcos/trust /var/lib/hcos-controller
+
+COPY dist/hcos-controller /usr/local/bin/hcos-controller
+COPY dist/hcos-server /usr/local/bin/hcos-server
+COPY dist/hcos-agent /var/lib/hcos/agents/sha-${HCOS_COMMIT_SHA}/hcos-agent
+COPY dist/hcos-base.efi /var/lib/hcos/images/hcos-sha-${HCOS_COMMIT_SHA}.efi
+COPY dist/bootx64.efi /srv/hcos-pxe/bootx64.efi
+# The iPXE loader is GPL licensed; include its corresponding source archive.
+COPY dist/ipxe-source.tar.gz /usr/share/source/ipxe-source.tar.gz
+
+RUN set -eu; \
+    ln -s /var/lib/hcos/agents/sha-${HCOS_COMMIT_SHA}/hcos-agent /usr/local/bin/hcos-agent; \
+    for binary in /usr/local/bin/hcos-controller /usr/local/bin/hcos-server \
+        /usr/local/bin/hcos-agent \
+        /var/lib/hcos/agents/sha-${HCOS_COMMIT_SHA}/hcos-agent; do \
+        test -x "$binary"; \
+        test "$(od -An -tx1 -N4 "$binary" | tr -d '[:space:]')" = 7f454c46; \
+    done; \
+    for efi in /var/lib/hcos/images/hcos-sha-${HCOS_COMMIT_SHA}.efi \
+        /srv/hcos-pxe/bootx64.efi; do \
+        test -s "$efi"; \
+        test "$(od -An -tx1 -N2 "$efi" | tr -d '[:space:]')" = 4d5a; \
+    done; \
+    test -s /usr/share/source/ipxe-source.tar.gz; \
+    test "$(od -An -tx1 -N2 /usr/share/source/ipxe-source.tar.gz | tr -d '[:space:]')" = 1f8b
+
+LABEL org.opencontainers.image.title="HCOS" \
+      org.opencontainers.image.description="HCOS controller, bootserver, agent, EFI and PXE loader" \
+      org.opencontainers.image.source="https://github.com/define42/HCOS" \
+      org.opencontainers.image.revision="${HCOS_COMMIT_SHA}"
+
+EXPOSE 9443/tcp 8443/tcp 80/tcp 67/udp 69/udp
+ENTRYPOINT ["/usr/local/bin/hcos-controller"]
+CMD ["--config", "/etc/hcos-controller/config.json"]

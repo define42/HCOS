@@ -23,7 +23,7 @@ make smoke-pxe            # Exercise controller PXE HTTP and TFTP on loopback.
 
 The EFI smoke tests need host `qemu-system-x86_64` and OVMF firmware. The injected and server tests also need OpenSSL. They use software emulation, so host KVM is not required. Run `make build` and `make components` before `make smoke-server`; `make smoke-control-plane` builds the Go components itself. Set both `OVMF_CODE` and `OVMF_VARS` to override firmware discovery. The default EFI test allows 300 seconds and 2 GiB guest RAM. Serial and QEMU logs are kept under `build/`.
 
-GitHub Actions builds and tests on pushes, pull requests, and manual dispatch. A push to `main` builds each new mainline commit and publishes six immutable GitHub Release assets tagged `hcos-<commit SHA>`: `hcos-base.efi`, `hcos-server`, `hcos-controller`, `hcos-agent`, `bootx64.efi`, and `ipxe-source.tar.gz`. A merge commit is a mainline state; commits that existed only on a merged feature branch are not separate mainline states. The newest successfully built main tip is marked as the latest release. The EFI asset remains generic; the boot server injects the selected agent and node config when requested.
+GitHub Actions builds and tests on pushes, pull requests, and manual dispatch. A push to `main` builds each new mainline commit and publishes six immutable GitHub Release assets tagged `hcos-<commit SHA>`: `hcos-base.efi`, `hcos-server`, `hcos-controller`, `hcos-agent`, `bootx64.efi`, and `ipxe-source.tar.gz`. A merge commit is a mainline state; commits that existed only on a merged feature branch are not separate mainline states. The newest successfully built main tip is marked as the latest release and container tag. The same commit is also published as `ghcr.io/define42/hcos:sha-<commit SHA>`. The EFI asset remains generic; the boot server injects the selected agent and node config when requested.
 
 Root login on the local VGA and serial consoles is locked by default. To enable it in a custom image, create a SHA-512 crypt hash in the local, ignored `config/root-password-hash` file before building. `openssl passwd -6` prompts for the password without putting it in the command line:
 
@@ -34,6 +34,57 @@ make build
 ```
 
 Anyone with the EFI file can attempt to guess its embedded password hash offline. Use a strong, unique password and limit access to custom images.
+
+## Container release
+
+The Linux/amd64 container carries the tested artifacts from the same commit. Its default process is `hcos-controller`; run `hcos-server` from a second container using the same image. The agent binary is packaged as a boot-server asset for injection into HCOS nodes. The image contains no node credentials, site CA, signing keys, or mutable controller state.
+
+[GitHub Container Registry](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry) initially makes a new package private; set the package visibility to public in GitHub if anonymous pulls are required.
+
+| Container path | Contents |
+| --- | --- |
+| `/usr/local/bin/hcos-controller` | Default controller process |
+| `/usr/local/bin/hcos-server` | Boot server and EFI personalization |
+| `/var/lib/hcos/images/hcos-sha-<commit SHA>.efi` | Generic base EFI |
+| `/var/lib/hcos/agents/sha-<commit SHA>/hcos-agent` | Agent for EFI injection |
+| `/srv/hcos-pxe/bootx64.efi` | x64 UEFI iPXE loader |
+| `/usr/share/source/ipxe-source.tar.gz` | Corresponding iPXE source archive |
+
+Set both `hcos_version` and `agent_version` in each boot-server node record to `sha-<commit SHA>`. Keep `images_dir` and `agents_dir` at `/var/lib/hcos/images` and `/var/lib/hcos/agents`. Mount the site trust directory and private writable cache separately so the packaged EFI and agent remain visible. Supply the server config, node records, TLS materials, and optional Secure Boot signing keys at their configured absolute paths.
+
+For example, after creating the config and data directories described below, run both services from a published image:
+
+```sh
+commit=REPLACE_WITH_40_CHARACTER_MAIN_COMMIT_SHA
+image="ghcr.io/define42/hcos:sha-$commit"
+docker pull "$image"
+
+docker run -d --name hcos-server --restart unless-stopped \
+  -p 8443:8443 \
+  --mount type=bind,src=/etc/hcos-server,dst=/etc/hcos-server,readonly \
+  --mount type=bind,src=/var/lib/hcos/trust,dst=/var/lib/hcos/trust,readonly \
+  --mount type=bind,src=/var/lib/hcos/cache,dst=/var/lib/hcos/cache \
+  --entrypoint /usr/local/bin/hcos-server "$image" \
+  --config /etc/hcos-server/server.json
+
+docker run -d --name hcos-controller --restart unless-stopped \
+  --network host \
+  --mount type=bind,src=/etc/hcos-controller,dst=/etc/hcos-controller,readonly \
+  --mount type=bind,src=/var/lib/hcos-controller,dst=/var/lib/hcos-controller \
+  "$image" --config /etc/hcos-controller/config.json
+```
+
+The controller uses host networking for PXE so it can bind the provisioning interface and serve DHCP, TFTP, and HTTP. Run it with a rootful Docker engine and the network capabilities needed to bind its configured ports and interface. Keep `/var/lib/hcos-controller` and `/var/lib/hcos/cache` private and writable by their respective processes. For Secure Boot signing, set `signing.command` to `/usr/bin/sbsign` and mount the key and certificate read-only.
+
+To check a local image built from the current checkout, build the six release artifacts first, then compare every packaged file byte for byte against `dist/`:
+
+```sh
+make build components ipxe
+commit=$(git rev-parse HEAD)
+docker build --platform linux/amd64 --file Dockerfile.release \
+  --build-arg "HCOS_COMMIT_SHA=$commit" --tag hcos:local .
+scripts/verify-container.sh hcos:local "$commit"
+```
 
 ## Boot-server injection
 
