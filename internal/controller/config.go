@@ -17,6 +17,7 @@ import (
 const (
 	maxConfigBytes = 1 << 20
 	apiPort        = "9443"
+	bootServerPort = "8443"
 	pxeHTTPPort    = "80"
 	pxeTFTPPort    = "69"
 	dhcpAddress    = "0.0.0.0:67"
@@ -45,6 +46,7 @@ func (c Config) RuntimePXE() *PXEConfig {
 		return nil
 	}
 	pxe := *c.PXE
+	pxe.BootServerURL = "https://" + net.JoinHostPort(c.ServerIP, bootServerPort)
 	pxe.HTTPListenAddress = net.JoinHostPort(c.ServerIP, pxeHTTPPort)
 	pxe.DHCP.ListenAddress = dhcpAddress
 	pxe.DHCP.ServerIP = c.ServerIP

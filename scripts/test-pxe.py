@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import secrets
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -98,7 +99,38 @@ def main():
         def log_message(self, *_args):
             pass  # Never log the boot token in a test URL.
 
-    bootserver = ThreadingHTTPServer(("127.0.0.1", 0), MockBootserver)
+    cert_temp = tempfile.TemporaryDirectory(prefix="hcos-pxe-tls-")
+    cert_dir = Path(cert_temp.name)
+    ca_cert = cert_dir / "boot-ca.crt"
+    ca_key = cert_dir / "boot-ca.key"
+    server_cert = cert_dir / "boot.crt"
+    server_key = cert_dir / "boot.key"
+    server_csr = cert_dir / "boot.csr"
+    extensions = cert_dir / "boot.ext"
+    extensions.write_text("subjectAltName=IP:127.0.0.1\n"
+                          "basicConstraints=critical,CA:FALSE\n"
+                          "extendedKeyUsage=serverAuth\n", encoding="utf-8")
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-nodes",
+        "-days", "1", "-subj", "/CN=HCOS PXE Smoke CA",
+        "-addext", "basicConstraints=critical,CA:TRUE",
+        "-keyout", str(ca_key), "-out", str(ca_cert),
+    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run([
+        "openssl", "req", "-newkey", "rsa:2048", "-sha256", "-nodes",
+        "-subj", "/CN=127.0.0.1", "-keyout", str(server_key),
+        "-out", str(server_csr),
+    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run([
+        "openssl", "x509", "-req", "-in", str(server_csr),
+        "-CA", str(ca_cert), "-CAkey", str(ca_key), "-CAcreateserial",
+        "-out", str(server_cert), "-days", "1", "-sha256",
+        "-extfile", str(extensions),
+    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    bootserver = ThreadingHTTPServer(("127.0.0.1", 8443), MockBootserver)
+    tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls_context.load_cert_chain(str(server_cert), str(server_key))
+    bootserver.socket = tls_context.wrap_socket(bootserver.socket, server_side=True)
     bootthread = threading.Thread(target=bootserver.serve_forever, daemon=True)
     bootthread.start()
     try:
@@ -110,7 +142,7 @@ def main():
                 "admin_token": admin_token,
                 "nodes": [{"id": "compute-01", "token": node_token}],
                 "pxe": {
-                    "boot_server_url": f"http://127.0.0.1:{bootserver.server_port}",
+                    "boot_ca_file": str(ca_cert),
                     "boot_tokens": {"compute-01": boot_token},
                     "dhcp": {
                         "interface": "lo",
@@ -169,6 +201,7 @@ def main():
     finally:
         bootserver.shutdown()
         bootserver.server_close()
+        cert_temp.cleanup()
     print("PASS: controller served the iPXE script, complete TFTP loader, and node EFI proxy")
 
 

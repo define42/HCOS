@@ -22,7 +22,7 @@ import (
 // the personalized EFI from the existing boot server. Boot tokens stay server-side.
 type PXEConfig struct {
 	HTTPListenAddress string            `json:"-"`
-	BootServerURL     string            `json:"boot_server_url"`
+	BootServerURL     string            `json:"-"`
 	BootCAFile        string            `json:"boot_ca_file,omitempty"`
 	DHCP              DHCPConfig        `json:"dhcp"`
 	TFTP              TFTPConfig        `json:"tftp"`
@@ -75,7 +75,7 @@ func (p PXEConfig) Validate(nodes []NodeCredential) error {
 	}
 	bootURL, err := parseBootServerURL(p.BootServerURL)
 	if err != nil {
-		return fmt.Errorf("pxe.boot_server_url: %w", err)
+		return fmt.Errorf("PXE boot server origin: %w", err)
 	}
 	if bootURL.Scheme == "https" {
 		if !filepath.IsAbs(p.BootCAFile) {

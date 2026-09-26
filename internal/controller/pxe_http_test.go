@@ -105,6 +105,21 @@ func TestPXEHTTPValidatesBootServerCA(t *testing.T) {
 	if got.Code != http.StatusOK || got.Body.String() != "MZ" {
 		t.Fatalf("verified TLS proxy returned HTTP %d and %q", got.Code, got.Body.String())
 	}
+	if err := upstream.Certificate().VerifyHostname("127.0.0.1"); err != nil {
+		t.Fatalf("test certificate must cover the server IP: %v", err)
+	}
+	if err := upstream.Certificate().VerifyHostname("localhost"); err == nil {
+		t.Fatal("test certificate unexpectedly covers localhost")
+	}
+	config.BootServerURL = strings.Replace(upstream.URL, "127.0.0.1", "localhost", 1)
+	handler, err = NewPXEHandler(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mismatch := requestPXE(handler, http.MethodGet, "http://127.0.0.1/boot/hcos.efi", "127.0.0.2:1234")
+	if mismatch.Code != http.StatusBadGateway {
+		t.Fatalf("TLS certificate without the requested hostname returned HTTP %d, want 502", mismatch.Code)
+	}
 }
 
 func TestPXERejectsMismatchedBootAssets(t *testing.T) {

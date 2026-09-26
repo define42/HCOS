@@ -2,8 +2,10 @@ package controller
 
 import (
 	"encoding/json"
+	"encoding/pem"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -128,6 +130,16 @@ func TestConfigDerivesFixedServiceAddresses(t *testing.T) {
 	config := testConfig(t)
 	pxe := testPXEConfig(t, "http://127.0.0.1:8080")
 	config.PXE = &pxe
+	if err := config.Validate(); err == nil || !strings.Contains(err.Error(), "boot_ca_file") {
+		t.Fatalf("PXE without an HTTPS boot CA: got %v, want boot_ca_file error", err)
+	}
+	upstream := httptest.NewTLSServer(http.NotFoundHandler())
+	defer upstream.Close()
+	pxe.BootCAFile = filepath.Join(t.TempDir(), "boot-ca.pem")
+	certificate := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: upstream.Certificate().Raw})
+	if err := os.WriteFile(pxe.BootCAFile, certificate, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := config.Validate(); err != nil {
 		t.Fatalf("controller configuration rejected: %v", err)
 	}
@@ -140,6 +152,9 @@ func TestConfigDerivesFixedServiceAddresses(t *testing.T) {
 	}
 	if runtime.HTTPListenAddress != "127.0.0.1:80" || runtime.TFTP.ListenAddress != "127.0.0.1:69" {
 		t.Fatalf("PXE listeners = HTTP %q, TFTP %q", runtime.HTTPListenAddress, runtime.TFTP.ListenAddress)
+	}
+	if runtime.BootServerURL != "https://127.0.0.1:8443" {
+		t.Fatalf("derived boot server URL = %q, want https://127.0.0.1:8443", runtime.BootServerURL)
 	}
 	if runtime.DHCP.ListenAddress != "0.0.0.0:67" || runtime.DHCP.ServerIP != config.ServerIP || runtime.DHCP.NextServerIP != config.ServerIP {
 		t.Fatalf("DHCP listener and server addresses = %+v", runtime.DHCP)
@@ -183,6 +198,7 @@ func TestConfigDerivesFixedServiceAddresses(t *testing.T) {
 func TestLoadConfigRejectsLegacyAddressFields(t *testing.T) {
 	config := testConfig(t)
 	pxe := testPXEConfig(t, "http://127.0.0.1:8080")
+	pxe.BootCAFile = filepath.Join(t.TempDir(), "boot-ca.pem")
 	config.PXE = &pxe
 	base, err := json.Marshal(config)
 	if err != nil {
@@ -200,8 +216,8 @@ func TestLoadConfigRejectsLegacyAddressFields(t *testing.T) {
 	if runtime == nil {
 		t.Fatal("loaded PXE configuration did not enable runtime services")
 	}
-	if loaded.ServerIP != "127.0.0.1" || loaded.APIAddress() != "127.0.0.1:9443" || runtime.HTTPListenAddress != "127.0.0.1:80" {
-		t.Fatalf("loaded single-IP addresses = server %q, API %q, PXE %q", loaded.ServerIP, loaded.APIAddress(), runtime.HTTPListenAddress)
+	if loaded.ServerIP != "127.0.0.1" || loaded.APIAddress() != "127.0.0.1:9443" || runtime.HTTPListenAddress != "127.0.0.1:80" || runtime.BootServerURL != "https://127.0.0.1:8443" {
+		t.Fatalf("loaded single-IP addresses = server %q, API %q, PXE %q, boot %q", loaded.ServerIP, loaded.APIAddress(), runtime.HTTPListenAddress, runtime.BootServerURL)
 	}
 	cases := []struct {
 		name  string
@@ -211,6 +227,7 @@ func TestLoadConfigRejectsLegacyAddressFields(t *testing.T) {
 	}{
 		{name: "controller listen_address", field: "listen_address", value: "127.0.0.1:9443"},
 		{name: "PXE http_listen_address", path: []string{"pxe"}, field: "http_listen_address", value: "127.0.0.1:80"},
+		{name: "PXE boot_server_url", path: []string{"pxe"}, field: "boot_server_url", value: "https://127.0.0.1:8443"},
 		{name: "DHCP listen_address", path: []string{"pxe", "dhcp"}, field: "listen_address", value: "0.0.0.0:67"},
 		{name: "DHCP server_ip", path: []string{"pxe", "dhcp"}, field: "server_ip", value: "127.0.0.1"},
 		{name: "DHCP next_server_ip", path: []string{"pxe", "dhcp"}, field: "next_server_ip", value: "127.0.0.1"},
