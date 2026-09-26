@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the controller PXE HTTP and TFTP listeners on loopback."""
+"""Exercise fixed-port controller PXE HTTP and TFTP on isolated loopback."""
 
 import hashlib
 import http.client
@@ -19,12 +19,6 @@ ROOT = Path(__file__).resolve().parent.parent
 CONTROLLER = ROOT / "dist/hcos-controller"
 LOADER = ROOT / "dist/bootx64.efi"
 IMAGE = b"MZtest-personalized-efi"
-
-
-def port(socktype):
-    with socket.socket(socket.AF_INET, socktype) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def http_get(host, port_number, path, source="127.0.0.1", method="GET"):
@@ -72,10 +66,9 @@ def tftp_loader(port_number):
 def main():
     if not CONTROLLER.is_file() or not LOADER.is_file():
         raise SystemExit("Run 'make ipxe components' first")
-    admin_port = port(socket.SOCK_STREAM)
-    http_port = port(socket.SOCK_STREAM)
-    dhcp_port = port(socket.SOCK_DGRAM)
-    tftp_port = port(socket.SOCK_DGRAM)
+    admin_port = 9443
+    http_port = 80
+    tftp_port = 69
     admin_token = secrets.token_hex(32)
     node_token = secrets.token_hex(32)
     boot_token = secrets.token_hex(32)
@@ -112,21 +105,18 @@ def main():
         with tempfile.TemporaryDirectory(prefix="hcos-pxe-") as temporary:
             work = Path(temporary)
             config = {
-                "listen_address": f"127.0.0.1:{admin_port}",
+                "server_ip": "127.0.0.1",
                 "state_dir": str(work / "state"),
                 "admin_token": admin_token,
                 "nodes": [{"id": "compute-01", "token": node_token}],
                 "pxe": {
-                    "http_listen_address": f"127.0.0.1:{http_port}",
                     "boot_server_url": f"http://127.0.0.1:{bootserver.server_port}",
                     "boot_tokens": {"compute-01": boot_token},
                     "dhcp": {
-                        "listen_address": f"127.0.0.1:{dhcp_port}",
-                        "interface": "lo", "server_ip": "127.0.0.1",
+                        "interface": "lo",
                         "subnet_mask": "255.0.0.0",
                         "leases": [{"node_id": "compute-01", "mac": "52:54:00:12:34:56", "ip": "127.0.0.2"}],
                     },
-                    "tftp": {"listen_address": f"127.0.0.1:{tftp_port}"},
                 },
             }
             config_path = work / "controller.json"

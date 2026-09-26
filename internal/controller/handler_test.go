@@ -19,9 +19,9 @@ const validDomainXML = "<domain type='kvm'><name>vm-01</name><os><type arch='x86
 func testConfig(t *testing.T) Config {
 	t.Helper()
 	return Config{
-		ListenAddress: "127.0.0.1:8081",
-		StateDir:      filepath.Join(t.TempDir(), "state"),
-		AdminToken:    strings.Repeat("a", 40),
+		ServerIP:   "127.0.0.1",
+		StateDir:   filepath.Join(t.TempDir(), "state"),
+		AdminToken: strings.Repeat("a", 40),
 		Nodes: []NodeCredential{
 			{ID: "compute-01", Token: strings.Repeat("b", 40)},
 			{ID: "compute-02", Token: strings.Repeat("c", 40)},

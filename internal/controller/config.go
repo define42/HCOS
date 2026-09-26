@@ -9,23 +9,48 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 )
 
-const maxConfigBytes = 1 << 20
+const (
+	maxConfigBytes = 1 << 20
+	apiPort        = "9443"
+	pxeHTTPPort    = "80"
+	pxeTFTPPort    = "69"
+	dhcpAddress    = "0.0.0.0:67"
+)
 
 // Config is the controller's local JSON configuration. Tokens are never logged.
 type Config struct {
-	ListenAddress string           `json:"listen_address"`
-	TLSCertFile   string           `json:"tls_cert_file,omitempty"`
-	TLSKeyFile    string           `json:"tls_key_file,omitempty"`
-	StateDir      string           `json:"state_dir"`
-	AdminToken    string           `json:"admin_token"`
-	Nodes         []NodeCredential `json:"nodes"`
-	PXE           *PXEConfig       `json:"pxe,omitempty"`
+	ServerIP    string           `json:"server_ip"`
+	TLSCertFile string           `json:"tls_cert_file,omitempty"`
+	TLSKeyFile  string           `json:"tls_key_file,omitempty"`
+	StateDir    string           `json:"state_dir"`
+	AdminToken  string           `json:"admin_token"`
+	Nodes       []NodeCredential `json:"nodes"`
+	PXE         *PXEConfig       `json:"pxe,omitempty"`
+}
+
+// APIAddress is the controller API listener on the configured IP.
+func (c Config) APIAddress() string {
+	return net.JoinHostPort(c.ServerIP, apiPort)
+}
+
+// RuntimePXE fills in the fixed listener and advertised addresses. DHCP binds
+// the provisioning interface on all IPv4 addresses to receive broadcasts.
+func (c Config) RuntimePXE() *PXEConfig {
+	if c.PXE == nil {
+		return nil
+	}
+	pxe := *c.PXE
+	pxe.HTTPListenAddress = net.JoinHostPort(c.ServerIP, pxeHTTPPort)
+	pxe.DHCP.ListenAddress = dhcpAddress
+	pxe.DHCP.ServerIP = c.ServerIP
+	pxe.DHCP.NextServerIP = c.ServerIP
+	pxe.TFTP.ListenAddress = net.JoinHostPort(c.ServerIP, pxeTFTPPort)
+	return &pxe
 }
 
 // NodeCredential binds one agent bearer token to one node ID.
@@ -80,22 +105,15 @@ func LoadConfig(path string) (Config, error) {
 
 // Validate rejects unsafe listener and credential configurations.
 func (c Config) Validate() error {
-	host, port, err := net.SplitHostPort(c.ListenAddress)
-	if err != nil {
-		return fmt.Errorf("listen_address: %w", err)
-	}
-	portNumber, err := strconv.Atoi(port)
-	if err != nil || portNumber < 1 || portNumber > 65535 {
-		return errors.New("listen_address must use a TCP port from 1 to 65535")
+	ip, err := netip.ParseAddr(c.ServerIP)
+	if err != nil || !ip.Is4() || ip.Zone() != "" || (!ip.IsGlobalUnicast() && !ip.IsLoopback()) {
+		return errors.New("server_ip must be a unicast IPv4 address")
 	}
 	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
 		return errors.New("tls_cert_file and tls_key_file must both be set")
 	}
-	if c.TLSCertFile == "" {
-		ip := net.ParseIP(host)
-		if !strings.EqualFold(host, "localhost") && (ip == nil || !ip.IsLoopback()) {
-			return errors.New("TLS is required unless listening on loopback")
-		}
+	if c.TLSCertFile == "" && !ip.IsLoopback() {
+		return errors.New("TLS is required unless listening on loopback")
 	}
 	if !filepath.IsAbs(c.StateDir) || filepath.Clean(c.StateDir) != c.StateDir || c.StateDir == string(filepath.Separator) {
 		return errors.New("state_dir must be a clean absolute non-root path")
@@ -129,8 +147,8 @@ func (c Config) Validate() error {
 		}
 		tokens[hash] = struct{}{}
 	}
-	if c.PXE != nil {
-		if err := c.PXE.Validate(c.Nodes); err != nil {
+	if pxe := c.RuntimePXE(); pxe != nil {
+		if err := pxe.Validate(c.Nodes); err != nil {
 			return err
 		}
 	}

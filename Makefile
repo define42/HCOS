@@ -38,4 +38,4 @@ smoke-control-plane: components
 	python3 scripts/test-control-plane.py
 
 smoke-pxe: components
-	python3 scripts/test-pxe.py
+	@sudo -n unshare -n sh -c 'ip link set lo up && python3 scripts/test-pxe.py'

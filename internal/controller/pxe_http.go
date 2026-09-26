@@ -21,7 +21,7 @@ import (
 // DHCP and TFTP deliver a small iPXE loader; HTTP serves its script and proxies
 // the personalized EFI from the existing boot server. Boot tokens stay server-side.
 type PXEConfig struct {
-	HTTPListenAddress string            `json:"http_listen_address"`
+	HTTPListenAddress string            `json:"-"`
 	BootServerURL     string            `json:"boot_server_url"`
 	BootCAFile        string            `json:"boot_ca_file,omitempty"`
 	DHCP              DHCPConfig        `json:"dhcp"`

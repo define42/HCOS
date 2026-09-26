@@ -5,7 +5,6 @@ import json
 import os
 from pathlib import Path
 import secrets
-import socket
 import ssl
 import subprocess
 import sys
@@ -57,20 +56,18 @@ def main():
         work = Path(temp)
         cert = work / "controller.crt"
         key = work / "controller.key"
+        server_ip = f"127.1.{secrets.randbelow(254) + 1}.{secrets.randbelow(254) + 1}"
         subprocess.run([
             "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
             "-keyout", str(key), "-out", str(cert), "-days", "1",
-            "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1",
+            "-subj", f"/CN={server_ip}", "-addext", f"subjectAltName=IP:{server_ip}",
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
-            port = sock.getsockname()[1]
-        base = f"https://127.0.0.1:{port}"
+        base = f"https://{server_ip}:9443"
         admin_token = secrets.token_hex(32)
         node_token = secrets.token_hex(32)
         controller_config = work / "controller.json"
         write_json(controller_config, {
-            "listen_address": f"127.0.0.1:{port}",
+            "server_ip": server_ip,
             "tls_cert_file": str(cert), "tls_key_file": str(key),
             "state_dir": str(work / "state"), "admin_token": admin_token,
             "nodes": [{"id": "compute-01", "token": node_token}],

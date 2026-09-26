@@ -18,10 +18,10 @@ import (
 // DHCPConfig configures a static, direct-attached IPv4 DHCP service. It must
 // run only on an isolated provisioning interface, never on a production LAN.
 type DHCPConfig struct {
-	ListenAddress string      `json:"listen_address"`
+	ListenAddress string      `json:"-"`
 	Interface     string      `json:"interface"`
-	ServerIP      string      `json:"server_ip"`
-	NextServerIP  string      `json:"next_server_ip,omitempty"`
+	ServerIP      string      `json:"-"`
+	NextServerIP  string      `json:"-"`
 	SubnetMask    string      `json:"subnet_mask"`
 	Router        string      `json:"router,omitempty"`
 	DNS           []string    `json:"dns,omitempty"`

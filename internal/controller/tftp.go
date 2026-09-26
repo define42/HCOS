@@ -40,7 +40,7 @@ const (
 // TFTPConfig identifies the listener and optional public boot script. TFTP
 // never serves a path supplied by a client or carries personalized EFI.
 type TFTPConfig struct {
-	ListenAddress string `json:"listen_address"`
+	ListenAddress string `json:"-"`
 	ScriptPath    string `json:"script_path,omitempty"`
 }
 

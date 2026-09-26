@@ -41,7 +41,7 @@ func run() error {
 		return err
 	}
 	server := &http.Server{
-		Addr:              config.ListenAddress,
+		Addr:              config.APIAddress(),
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
@@ -49,7 +49,7 @@ func run() error {
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    16 << 10,
 	}
-	listener, err := net.Listen("tcp", config.ListenAddress)
+	listener, err := net.Listen("tcp4", config.APIAddress())
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
@@ -70,9 +70,9 @@ func run() error {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- server.Serve(listener) }()
 	var pxeErr chan error
-	if config.PXE != nil {
+	if pxe := config.RuntimePXE(); pxe != nil {
 		pxeErr = make(chan error, 1)
-		go func() { pxeErr <- runPXE(ctx, *config.PXE) }()
+		go func() { pxeErr <- runPXE(ctx, *pxe) }()
 	}
 	var firstErr error
 	adminDone, pxeDone := false, false
