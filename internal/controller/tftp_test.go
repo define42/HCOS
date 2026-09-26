@@ -349,7 +349,17 @@ func TestTFTPServesOnlyRequestingNodesScript(t *testing.T) {
 		if got := string(testDHCPOptions(t, offer.Packet)[67]); got != "bootx64.efi" {
 			t.Fatalf("DHCP firmware boot file = %q", got)
 		}
-		name := "boot.ipxe"
+		ipxeDiscover := testDHCPRequest(1, 93, 2, 0, 9, 175, 0)
+		copy(ipxeDiscover[28:34], mac)
+		ipxeOffer, ok := dhcp.HandlePacket(ipxeDiscover)
+		if !ok || ipxeOffer.NodeID != node.ID {
+			t.Fatalf("DHCP did not identify iPXE node %s", node.ID)
+		}
+		bootURL, err := url.Parse(string(testDHCPOptions(t, ipxeOffer.Packet)[67]))
+		if err != nil || bootURL.Scheme != "tftp" || bootURL.Host != config.ServerIP || bootURL.Path != "/boot.ipxe" || bootURL.RawQuery != "" {
+			t.Fatal("DHCP did not direct iPXE to the controller TFTP script")
+		}
+		name := strings.TrimPrefix(bootURL.Path, "/")
 		if index == 1 {
 			name = "boot/boot.ipxe"
 		}
@@ -398,7 +408,7 @@ func TestTFTPServesOnlyRequestingNodesScript(t *testing.T) {
 func TestTFTPCancelClosesPendingScriptTransfer(t *testing.T) {
 	server, err := NewTFTPServer(TFTPConfig{
 		ListenAddress: "127.0.0.1:1069",
-		scripts:       map[string][]byte{"127.0.0.2": pxeBootScript("127.0.0.1", "compute-01", testPXENodeToken)},
+		scripts:       map[string][]byte{"127.0.0.2": pxeBootScript("127.0.0.1", "compute-01", strings.Repeat("t", 40))},
 	})
 	if err != nil {
 		t.Fatal(err)

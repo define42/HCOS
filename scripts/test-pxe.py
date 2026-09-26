@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise node mapping, then boot-server HTTP/HTTPS listeners on loopback."""
+"""Exercise DHCP, personalized TFTP scripts, and direct HTTP/HTTPS boot on loopback."""
 
 from contextlib import ExitStack
 import hashlib
@@ -41,6 +41,55 @@ def request(port, path, source="127.0.0.2", method="GET", tls=None, headers=None
         return response.status, dict(response.getheaders()), response.read()
     finally:
         connection.close()
+
+
+def dhcp_boot_file(mac, source, ipxe=False):
+    packet = bytearray(240)
+    packet[:3] = b"\x01\x01\x06"
+    packet[4:8] = secrets.token_bytes(4)
+    packet[12:16] = socket.inet_aton(source)
+    packet[28:34] = bytes.fromhex(mac.replace(":", ""))
+    packet[236:240] = b"\x63\x82\x53\x63"
+    # DHCPREQUEST renewal for this static address, with UEFI x64 architecture.
+    packet.extend(b"\x35\x01\x03\x5d\x02\x00\x09")
+    if ipxe:
+        packet.extend(b"\x3c\x04iPXE")
+    packet.append(255)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
+        client.bind((source, 68))
+        client.settimeout(1)
+        for _ in range(5):
+            client.sendto(packet, (SERVER_IP, 67))
+            try:
+                reply, peer = client.recvfrom(4096)
+                break
+            except socket.timeout:
+                continue
+        else:
+            raise AssertionError("DHCP did not reply to the configured node")
+    if (peer != (SERVER_IP, 67) or len(reply) < 240 or reply[:3] != b"\x02\x01\x06"
+            or reply[4:8] != packet[4:8] or reply[16:20] != socket.inet_aton(source)
+            or reply[20:24] != socket.inet_aton(SERVER_IP) or reply[28:34] != packet[28:34]
+            or reply[236:240] != packet[236:240]):
+        raise AssertionError("DHCP replied with the wrong node address or next server")
+    options = {}
+    offset = 240
+    while offset < len(reply):
+        code = reply[offset]
+        offset += 1
+        if code == 255:
+            break
+        if code == 0:
+            continue
+        if offset >= len(reply) or offset + 1 + reply[offset] > len(reply):
+            raise AssertionError("DHCP returned a truncated option")
+        length = reply[offset]
+        offset += 1
+        options[code] = reply[offset:offset + length]
+        offset += length
+    if options.get(53) != b"\x05" or options.get(54) != socket.inet_aton(SERVER_IP):
+        raise AssertionError("DHCP did not acknowledge the static lease")
+    return options.get(67, b"").decode("ascii")
 
 
 def tftp_file(filename, source="127.0.0.2"):
@@ -192,7 +241,7 @@ def main():
             })
         write_json(work / "nodes.json", {"nodes": nodes})
         server_config = {
-            "listen": "127.0.0.1:8443", "pxe_http": False,
+            "listen": "127.0.0.1:8443", "pxe_http": True,
             "tls_cert": str(server_cert), "tls_key": str(server_key),
             "images_dir": str(work / "images"), "agents_dir": str(work / "agents"),
             "trust_dir": str(work / "trust"), "cache_dir": str(work / "cache"),
@@ -207,7 +256,6 @@ def main():
                 "mac": f"52:54:00:12:34:{index + 56:02d}", "ip": f"127.0.0.{index + 2}",
             } for index, node_id in enumerate(node_ids)],
             "pxe": {
-                "boot_ca_file": str(ca_cert),
                 "dhcp": {"interface": "lo", "subnet_mask": "255.0.0.0"},
             },
         })
@@ -224,25 +272,22 @@ def main():
         tls = ssl.create_default_context(cafile=str(ca_cert))
         wait_ready(bootserver, 8443, tls=tls)
         wait_ready(controller, 9443)
-        for _ in range(100):
-            if controller.poll() is not None:
-                raise AssertionError("controller exited before PXE readiness")
-            try:
-                status, _, _ = request(80, "/boot/boot.ipxe")
-                if status == 200:
-                    break
-            except (ConnectionError, OSError):
-                pass
-            time.sleep(0.1)
-        else:
-            raise AssertionError("controller PXE HTTP did not become ready")
-
-        loader = tftp_file("bootx64.efi")
+        wait_ready(bootserver, 80)
+        firmware_file = dhcp_boot_file("52:54:00:12:34:56", "127.0.0.2")
+        if firmware_file != "bootx64.efi":
+            raise AssertionError("DHCP did not advertise the embedded iPXE loader")
+        loader = tftp_file(firmware_file)
         if not loader.startswith(b"MZ") or hashlib.sha256(loader).digest() != hashlib.sha256(LOADER.read_bytes()).digest():
             raise AssertionError("TFTP loader differs from the embedded release loader")
         paths = []
         for index, node_id in enumerate(node_ids):
-            script = tftp_file("boot.ipxe", source=f"127.0.0.{index + 2}").decode()
+            source = f"127.0.0.{index + 2}"
+            mac = f"52:54:00:12:34:{index + 56:02d}"
+            script_url = urlsplit(dhcp_boot_file(mac, source, ipxe=True))
+            if (script_url.scheme != "tftp" or script_url.netloc != SERVER_IP
+                    or script_url.path != "/boot.ipxe" or script_url.query or script_url.fragment):
+                raise AssertionError("DHCP did not advertise the controller TFTP script")
+            script = tftp_file(script_url.path.lstrip("/"), source=source).decode()
             lines = script.splitlines()
             if len(lines) != 2 or lines[0] != "#!ipxe" or not lines[1].startswith("chain "):
                 raise AssertionError("TFTP did not return the expected iPXE script")
@@ -269,29 +314,6 @@ def main():
         else:
             raise AssertionError("unknown source IP received a personalized script")
 
-        proxy_images = []
-        for index in range(len(node_ids)):
-            status, _, image = request(80, "/boot/hcos.efi", source=f"127.0.0.{index + 2}")
-            if (status != 200 or encoded_token(node_tokens[index]) not in image
-                    or encoded_token(node_tokens[1 - index]) in image):
-                raise AssertionError("controller proxy did not use the matching consolidated node")
-            proxy_images.append(image)
-        status, _, _ = request(80, "/boot/hcos.efi", source="127.0.0.4")
-        if status != 403:
-            raise AssertionError("controller proxy accepted an unknown source IP")
-
-        # The controller still owns port 80. Exercise the boot server's optional
-        # HTTP listener separately until the production listener handoff is complete.
-        stop_process(controller)
-        stop_process(bootserver)
-        server_config["pxe_http"] = True
-        write_json(work / "server.json", server_config)
-        output = stack.enter_context((work / "server.log").open("ab"))
-        bootserver = subprocess.Popen([str(BOOTSERVER), "-config", str(work / "server.json")],
-                                      stdout=output, stderr=subprocess.STDOUT, cwd=work)
-        stack.callback(stop_process, bootserver)
-        wait_ready(bootserver, 8443, tls=tls)
-        wait_ready(bootserver, 80)
         images = []
         for index, path in enumerate(paths):
             source = f"127.0.0.{index + 2}"
@@ -308,8 +330,6 @@ def main():
             status, _, secure_image = request(8443, path, source=source, tls=tls)
             if status != 200 or secure_image != image:
                 raise AssertionError("HTTP and HTTPS did not serve the same personalized EFI")
-            if image != proxy_images[index]:
-                raise AssertionError("controller proxy and direct boot server selected different node images")
             images.append(image)
         if images[0] == images[1] or len(list((work / "cache").glob("*.efi"))) != 2:
             raise AssertionError("node cache entries were not distinct and shared between listeners")
@@ -319,13 +339,18 @@ def main():
                 status, _, _ = request(port, path, tls=context)
                 if status != 403:
                     raise AssertionError(f"port {port} accepted a missing or incorrect node token")
+        # Downloads remain available after DHCP/TFTP and the controller API stop.
+        stop_process(controller)
+        status, _, image = request(80, paths[0])
+        if status != 200 or image != images[0]:
+            raise AssertionError("direct EFI download depended on the controller")
         stop_process(bootserver)
         for log_name in ("server.log", "controller.log"):
             log = (work / log_name).read_text(encoding="utf-8")
             if any(token in log or quote(token, safe="") in log
                    or encoded_token(token).decode() in log for token in node_tokens):
                 raise AssertionError("a service logged a node token")
-    print("PASS: shared node tokens authorize controller API and personalized EFIs; separate HTTP/HTTPS boot-server phase")
+    print("PASS: DHCP to TFTP to direct HTTP EFI; shared node authentication; HTTPS; downloads with controller stopped")
 
 
 if __name__ == "__main__":

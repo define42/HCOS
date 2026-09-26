@@ -81,14 +81,14 @@ func run() error {
 		adminDone = true
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			firstErr = fmt.Errorf("serve controller API: %w", err)
-		} else {
+		} else if ctx.Err() == nil {
 			firstErr = errors.New("controller API stopped unexpectedly")
 		}
 	case err := <-pxeErr:
 		pxeDone = true
 		if err != nil {
 			firstErr = err
-		} else {
+		} else if ctx.Err() == nil {
 			firstErr = errors.New("PXE services stopped unexpectedly")
 		}
 	case <-ctx.Done():

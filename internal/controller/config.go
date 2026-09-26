@@ -17,8 +17,6 @@ import (
 const (
 	maxConfigBytes = 1 << 20
 	apiPort        = "9443"
-	bootServerPort = "8443"
-	pxeHTTPPort    = "80"
 	pxeTFTPPort    = "69"
 	dhcpAddress    = "0.0.0.0:67"
 )
@@ -47,14 +45,14 @@ func (c Config) RuntimePXE() *PXEConfig {
 		return nil
 	}
 	pxe := *c.PXE
-	pxe.BootServerURL = "https://" + net.JoinHostPort(c.ServerIP, bootServerPort)
-	pxe.HTTPListenAddress = net.JoinHostPort(c.ServerIP, pxeHTTPPort)
 	pxe.DHCP.ListenAddress = dhcpAddress
 	pxe.DHCP.ServerIP = c.ServerIP
 	pxe.DHCP.NextServerIP = c.ServerIP
+	if pxe.DHCP.IPXEBootFile == "" {
+		pxe.DHCP.IPXEBootFile = tftpScriptURL(c.ServerIP)
+	}
 	pxe.TFTP.ListenAddress = net.JoinHostPort(c.ServerIP, pxeTFTPPort)
 	pxe.DHCP.Leases = make([]DHCPLease, 0, len(c.Nodes))
-	pxe.NodeTokens = make(map[string]string, len(c.Nodes))
 	pxe.TFTP.scripts = make(map[string][]byte, len(c.Nodes))
 	for _, node := range c.Nodes {
 		if !node.hasPXE() {
@@ -65,7 +63,6 @@ func (c Config) RuntimePXE() *PXEConfig {
 			MAC:    node.MAC,
 			IP:     node.IP,
 		})
-		pxe.NodeTokens[node.ID] = node.Token
 		pxe.TFTP.scripts[node.IP] = pxeBootScript(c.ServerIP, node.ID, node.Token)
 	}
 	return &pxe
