@@ -8,13 +8,64 @@ on:
 permissions:
   contents: read
 
-# Keep every main-branch push so each successful push can publish its EFI.
+# Main pushes have distinct groups so a later push cannot cancel earlier builds.
 concurrency:
-  group: hcos-${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || 'latest' }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  group: hcos-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.sha || 'latest' }}
+  cancel-in-progress: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}
 
 jobs:
-  build:
+  select_main_commits:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    outputs:
+      commits: ${{ steps.select.outputs.commits }}
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Select new mainline commits
+        id: select
+        shell: bash
+        env:
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          commits_file="$RUNNER_TEMP/main-commits"
+          if [[ "$BEFORE" =~ ^0{40}$ ]]; then
+            printf '%s\n' "$AFTER" > "$commits_file"
+          else
+            if ! git cat-file -e "${BEFORE}^{commit}"; then
+              echo "::error::The previous main commit is unavailable; cannot enumerate this push." >&2
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$BEFORE" "$AFTER"; then
+              echo "::error::Main was rewritten; the newly added mainline commits are ambiguous." >&2
+              exit 1
+            fi
+            git rev-list --first-parent --reverse "${BEFORE}..${AFTER}" > "$commits_file"
+          fi
+
+          count="$(wc -l < "$commits_file")"
+          if (( count == 0 )); then
+            echo "::error::This push contains no new mainline commits." >&2
+            exit 1
+          fi
+          if (( count > 256 )); then
+            echo "::error::This push adds $count mainline commits; GitHub's matrix limit is 256. Split the push or release the commits in batches." >&2
+            exit 1
+          fi
+
+          commits="$(python3 -c 'import json,sys; print(json.dumps([line.strip() for line in sys.stdin if line.strip()]))' < "$commits_file")"
+          printf 'commits=%s\n' "$commits" >> "$GITHUB_OUTPUT"
+          echo "Selected $count mainline commit(s):"
+          cat "$commits_file"
+
+  build_head:
+    if: github.event_name != 'push' || github.ref != 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -23,10 +74,17 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Set up Go
+        if: ${{ hashFiles('go.mod') != '' }}
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
       - name: Install validation tools
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y shellcheck qemu-system-x86 ovmf
+          sudo apt-get install --no-install-recommends -y openssl shellcheck qemu-system-x86 ovmf
 
       - name: Check scripts
         run: make check
@@ -34,46 +92,156 @@ jobs:
       - name: Build EFI image
         run: make build
 
+      - name: Build HCOS Go components
+        if: ${{ hashFiles('go.mod') != '' }}
+        run: make components
+
       - name: Verify EFI contents
         run: make verify
 
       - name: Boot EFI image in QEMU
         run: make smoke
 
-      - name: Upload EFI image
+      - name: Boot EFI with injected agent and CA
+        run: make smoke-injected
+
+      - name: Boot EFI assembled by HCOS server
+        if: ${{ hashFiles('go.mod') != '' }}
+        run: make smoke-server
+
+      - name: Exercise HCOS controller and agent
+        if: ${{ hashFiles('go.mod') != '' }}
+        run: make smoke-control-plane
+
+      - name: Upload build files
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: hcos-efi
-          path: dist/hcos.efi
+          name: hcos-build
+          path: |
+            dist/hcos-base.efi
+            dist/hcos-server
+            dist/hcos-controller
+            dist/hcos-agent
           compression-level: 0
           if-no-files-found: error
           retention-days: 14
 
-  release:
+  build_main_commits:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: build
+    needs: select_main_commits
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        commit: ${{ fromJSON(needs.select_main_commits.outputs.commits) }}
+    steps:
+      - name: Check out mainline commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.commit }}
+          persist-credentials: false
+
+      - name: Set up Go
+        if: ${{ hashFiles('go.mod') != '' }}
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Install validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y openssl shellcheck qemu-system-x86 ovmf
+
+      - name: Check scripts
+        run: make check
+
+      - name: Build EFI image
+        run: make build
+
+      - name: Build HCOS Go components
+        if: ${{ hashFiles('go.mod') != '' }}
+        run: make components
+
+      - name: Verify EFI contents
+        run: make verify
+
+      - name: Boot EFI image in QEMU
+        run: make smoke
+
+      - name: Boot EFI with injected agent and CA
+        run: make smoke-injected
+
+      - name: Boot EFI assembled by HCOS server
+        if: ${{ hashFiles('go.mod') != '' }}
+        run: make smoke-server
+
+      - name: Exercise HCOS controller and agent
+        if: ${{ hashFiles('go.mod') != '' }}
+        run: make smoke-control-plane
+
+      - name: Publish immutable GitHub release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ matrix.commit }}
+        run: |
+          set -euo pipefail
+          tag="hcos-${COMMIT_SHA}"
+          assets=(dist/hcos-base.efi)
+          for binary in dist/hcos-server dist/hcos-controller dist/hcos-agent; do
+            if [[ -f "$binary" ]]; then
+              assets+=("$binary")
+            fi
+          done
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            asset_names="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+            for asset in "${assets[@]}"; do
+              name="${asset##*/}"
+              if printf '%s\n' "$asset_names" | grep -Fxq "$name"; then
+                echo "Release $tag already has $name; keeping the published asset."
+              else
+                gh release upload "$tag" "$asset" --repo "$GITHUB_REPOSITORY"
+              fi
+            done
+          else
+            gh release create "$tag" "${assets[@]}" \
+              --latest=false \
+              --notes "HCOS EFI and components built and tested from commit ${COMMIT_SHA}." \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$COMMIT_SHA" \
+              --title "HCOS ${COMMIT_SHA:0:12}"
+          fi
+
+  mark_latest:
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.select_main_commits.result == 'success' && needs.build_main_commits.result == 'success' }}
+    needs: [select_main_commits, build_main_commits]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - name: Download EFI image
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: hcos-efi
-          path: dist
-
-      - name: Publish GitHub release
+      - name: Mark the current main tip as latest
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          PUSH_TIP: ${{ github.sha }}
         run: |
           set -euo pipefail
-          tag="hcos-${GITHUB_SHA}"
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/hcos.efi --clobber --repo "$GITHUB_REPOSITORY"
-          else
-            gh release create "$tag" dist/hcos.efi \
-              --generate-notes \
-              --repo "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" \
-              --title "HCOS ${GITHUB_SHA:0:12}"
+          current_tip="$(gh api "repos/$GITHUB_REPOSITORY/branches/main" --jq '.commit.sha')"
+          if [[ "$current_tip" != "$PUSH_TIP" ]]; then
+            echo "Main moved to $current_tip; a newer push will mark its release latest."
+            exit 0
           fi
+
+          tag="hcos-${PUSH_TIP}"
+          asset_names="$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          if ! printf '%s\n' "$asset_names" | grep -Fxq 'hcos-base.efi'; then
+            echo "::error::Release $tag has no hcos-base.efi asset." >&2
+            exit 1
+          fi
+
+          gh release edit "$tag" --latest --repo "$GITHUB_REPOSITORY"

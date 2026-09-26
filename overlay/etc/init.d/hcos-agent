@@ -1,0 +1,21 @@
+#!/sbin/openrc-run
+# shellcheck disable=SC2034
+
+name="HCOS Agent"
+description="HCOS node management agent"
+
+command="/usr/local/bin/hcos-agent"
+command_args="--config /etc/hcos/config.json"
+
+command_background="yes"
+pidfile="/run/hcos-agent.pid"
+
+supervisor="supervise-daemon"
+
+respawn_delay=5
+respawn_max=0
+
+depend() {
+    need net
+    after libvirtd
+}

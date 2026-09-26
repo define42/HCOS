@@ -36,4 +36,20 @@ ln -sf /proc/self/fd/1 /dev/stdout
 ln -sf /proc/self/fd/2 /dev/stderr
 mkdir -p /run/openrc
 
+# A personalized initramfs adds all three files before /init runs.
+if [ -e /etc/hcos/root-ca.crt ] || [ -e /etc/hcos/config.json ] || \
+   [ -e /usr/local/bin/hcos-agent ]; then
+    if [ ! -s /etc/hcos/root-ca.crt ] || [ ! -s /etc/hcos/config.json ] || \
+       [ ! -x /usr/local/bin/hcos-agent ]; then
+        printf '%s\n' 'HCOS injection is incomplete.' > /dev/console
+        exit 1
+    fi
+    mkdir -p /usr/local/share/ca-certificates
+    cp /etc/hcos/root-ca.crt \
+        /usr/local/share/ca-certificates/hcos-root-ca.crt
+    chmod 0644 /usr/local/share/ca-certificates/hcos-root-ca.crt
+    update-ca-certificates
+    ln -s /etc/init.d/hcos-agent /etc/runlevels/default/hcos-agent
+fi
+
 exec /sbin/init

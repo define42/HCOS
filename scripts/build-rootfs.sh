@@ -151,10 +151,10 @@ ukify build --linux "$work/vmlinuz" --initrd "$work/rootfs.cpio.gz" \
     --cmdline @/src/config/cmdline --os-release "@$root/etc/os-release" \
     --uname "$kernel_version" --efi-arch x64 \
     --stub /usr/lib/systemd/boot/efi/linuxx64.efi.stub \
-    --output "$work/hcos.efi"
-python3 /src/scripts/verify-image.py "$work/hcos.efi"
-install -m 0644 "$work/hcos.efi" /out/.hcos.efi.tmp
-chown "${OUTPUT_UID:-0}:${OUTPUT_GID:-0}" /out/.hcos.efi.tmp
-mv /out/.hcos.efi.tmp /out/hcos.efi
+    --output "$work/hcos-base.efi"
+python3 /src/scripts/verify-image.py "$work/hcos-base.efi"
+install -m 0644 "$work/hcos-base.efi" /out/.hcos-base.efi.tmp
+chown "${OUTPUT_UID:-0}:${OUTPUT_GID:-0}" /out/.hcos-base.efi.tmp
+mv /out/.hcos-base.efi.tmp /out/hcos-base.efi
 printf 'Built '
-ls -lh /out/hcos.efi
+ls -lh /out/hcos-base.efi

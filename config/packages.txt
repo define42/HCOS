@@ -1,5 +1,6 @@
 # Alpine packages in the deployed RAM root. Dependencies are installed by apk.
 alpine-base
+ca-certificates
 linux-lts
 linux-firmware-none
 linux-firmware-rtl_nic

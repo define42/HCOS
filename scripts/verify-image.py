@@ -115,7 +115,8 @@ def section_text(image, section):
 def read_archive(stream):
     entries = {}
     contents = {}
-    capture = {"init", "etc/inittab", "etc/os-release", "etc/fstab"}
+    capture = {"init", "etc/inittab", "etc/os-release", "etc/fstab",
+               "etc/init.d/hcos-agent"}
     while True:
         header = read_exact(stream, 110)
         check(header[:6] == b"070701", "initramfs is not a newc cpio archive")
@@ -237,7 +238,8 @@ def verify_console_logins(entries, inittab):
 def verify_rootfs(entries, contents, kernel_version):
     for name in ("init", "sbin/init", "sbin/openrc", "usr/bin/qemu-system-x86_64",
                  "usr/bin/qemu-img", "usr/bin/virsh", "usr/sbin/libvirtd",
-                 "usr/sbin/virtlogd", "usr/sbin/virtlockd"):
+                 "usr/sbin/virtlogd", "usr/sbin/virtlockd",
+                 "usr/sbin/update-ca-certificates", "etc/init.d/hcos-agent"):
         executable(entries, name)
     for name in LIBVIRT_DRIVERS:
         driver(entries, name)
@@ -248,12 +250,26 @@ def verify_rootfs(entries, contents, kernel_version):
               f"missing libvirt configuration or OpenRC service /{name}")
     for name in DEFAULT_SERVICES:
         enabled_service(entries, name)
+    check("etc/runlevels/default/hcos-agent" not in entries,
+          "generic base must enable hcos-agent only after injection")
+    for name in ("etc/hcos/root-ca.crt", "etc/hcos/config.json",
+                 "usr/local/bin/hcos-agent"):
+        check(name not in entries, f"generic base includes node-specific /{name}")
+    agent_service = contents.get("etc/init.d/hcos-agent", "")
+    check('command="/usr/local/bin/hcos-agent"' in agent_service and
+          'command_args="--config /etc/hcos/config.json"' in agent_service and
+          'supervisor="supervise-daemon"' in agent_service,
+          "hcos-agent service has the wrong command or supervisor")
     console = resolve(entries, "dev/console")
     check(stat.S_ISCHR(console.mode) and (console.major, console.minor) == (5, 1),
           "initramfs needs character device /dev/console (5:1)")
 
     init = contents.get("init", "")
     check(re.search(r"\bexec\s+/sbin/init\b", init), "/init must start OpenRC init")
+    check("/etc/hcos/root-ca.crt" in init and
+          "update-ca-certificates" in init and
+          "etc/runlevels/default/hcos-agent" in init,
+          "/init must trust the injected CA and enable the agent")
     inittab = contents.get("etc/inittab", "")
     check(re.search(r"/sbin/openrc\s+sysinit", inittab) and
           re.search(r"/sbin/openrc\s+default", inittab),
@@ -322,7 +338,7 @@ def verify(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("image", nargs="?", type=Path, default=Path("dist/hcos.efi"))
+    parser.add_argument("image", nargs="?", type=Path, default=Path("dist/hcos-base.efi"))
     args = parser.parse_args()
     try:
         verify(args.image)

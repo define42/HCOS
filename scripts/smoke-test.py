@@ -16,7 +16,6 @@ import time
 
 
 READY_MARKER = "HCOS virtualization ready"
-IMAGE_NAME = "hcos.efi"
 FIRMWARE_DIRS = (
     Path("/usr/share/OVMF"),
     Path("/usr/share/edk2/ovmf"),
@@ -80,7 +79,7 @@ class ImageServer(http.server.SimpleHTTPRequestHandler):
                       ".efi": "application/efi"}
 
     def do_GET(self):
-        if self.path == f"/{IMAGE_NAME}":
+        if self.path == f"/{self.server.image_name}":
             self.server.downloaded.set()
         super().do_GET()
 
@@ -96,7 +95,7 @@ def recent_output(path, limit=16000):
         return output.read().decode(errors="replace")
 
 
-def run(image, timeout, memory):
+def run(image, timeout, memory, expected_markers=()):
     qemu = shutil.which("qemu-system-x86_64")
     if not qemu:
         raise ValueError("qemu-system-x86_64 not found; install qemu-system-x86")
@@ -111,13 +110,14 @@ def run(image, timeout, memory):
     handler = functools.partial(ImageServer, directory=str(image.parent))
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     server.downloaded = threading.Event()
+    server.image_name = image.name
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     try:
         with tempfile.TemporaryDirectory(prefix="hcos-smoke-") as temporary:
             vars_copy = Path(temporary) / "OVMF_VARS.fd"
             shutil.copyfile(variables, vars_copy)
-            url = f"http://10.0.2.2:{server.server_port}/{IMAGE_NAME}"
+            url = f"http://10.0.2.2:{server.server_port}/{image.name}"
             command = [
                 qemu,
                 "-machine", "q35,accel=tcg",
@@ -155,7 +155,9 @@ def run(image, timeout, memory):
                             serial_text = (serial_text + chunk.decode(errors="replace"))[-65536:]
                             if "Kernel panic" in serial_text:
                                 raise RuntimeError("guest kernel panicked")
-                            if READY_MARKER in serial_text and "login:" in serial_text and server.downloaded.is_set():
+                            if (READY_MARKER in serial_text and "login:" in serial_text and
+                                    all(marker in serial_text for marker in expected_markers) and
+                                    server.downloaded.is_set()):
                                 print(f"PASS: HTTP-loaded EFI reached {READY_MARKER!r}, "
                                       f"active guest networking, and the serial login prompt; "
                                       f"logs in {logs}.")
@@ -164,7 +166,8 @@ def run(image, timeout, memory):
                             raise RuntimeError(f"QEMU exited with status {process.returncode}")
                         time.sleep(0.5)
                     raise RuntimeError(f"guest did not report {READY_MARKER!r} "
-                                       f"and an authenticated login prompt within {timeout} seconds")
+                                       f"and an authenticated login prompt, plus markers {expected_markers!r} "
+                                       f"within {timeout} seconds")
                 finally:
                     if process.poll() is None:
                         process.terminate()
@@ -186,7 +189,9 @@ def run(image, timeout, memory):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("image", nargs="?", type=Path, default=Path("dist/hcos.efi"))
+    parser.add_argument("image", nargs="?", type=Path, default=Path("dist/hcos-base.efi"))
+    parser.add_argument("--expect", action="append", default=[], metavar="TEXT",
+                        help="also wait for this serial output (repeatable)")
     parser.add_argument("--timeout", type=int, default=300, metavar="SECONDS")
     parser.add_argument("--memory", type=int, default=2048, metavar="MIB")
     args = parser.parse_args()
@@ -194,9 +199,9 @@ def main():
         parser.error("--timeout must be positive and --memory must be at least 512 MiB")
     try:
         image = args.image.resolve(strict=True)
-        if image.name != IMAGE_NAME:
-            parser.error(f"image must be named {IMAGE_NAME}")
-        run(image, args.timeout, args.memory)
+        if image.suffix.lower() != ".efi":
+            parser.error("image must have an .efi filename")
+        run(image, args.timeout, args.memory, args.expect)
     except (OSError, ValueError) as error:
         parser.error(str(error))
 
