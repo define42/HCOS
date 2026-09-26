@@ -68,25 +68,49 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	serveErr := make(chan error, 1)
-	go func() {
-		serveErr <- server.Serve(listener)
-	}()
+	go func() { serveErr <- server.Serve(listener) }()
+	var pxeErr chan error
+	if config.PXE != nil {
+		pxeErr = make(chan error, 1)
+		go func() { pxeErr <- runPXE(ctx, *config.PXE) }()
+	}
+	var firstErr error
+	adminDone, pxeDone := false, false
 	select {
 	case err := <-serveErr:
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
+		adminDone = true
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			firstErr = fmt.Errorf("serve controller API: %w", err)
+		} else {
+			firstErr = errors.New("controller API stopped unexpectedly")
 		}
-		return fmt.Errorf("serve: %w", err)
+	case err := <-pxeErr:
+		pxeDone = true
+		if err != nil {
+			firstErr = err
+		} else {
+			firstErr = errors.New("PXE services stopped unexpectedly")
+		}
 	case <-ctx.Done():
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			server.Close()
-			return fmt.Errorf("shutdown: %w", err)
-		}
-		if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return fmt.Errorf("serve: %w", err)
-		}
-		return nil
 	}
+	stop()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		_ = server.Close()
+		if firstErr == nil {
+			firstErr = fmt.Errorf("shutdown controller API: %w", err)
+		}
+	}
+	if !adminDone {
+		if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) && firstErr == nil {
+			firstErr = fmt.Errorf("serve controller API: %w", err)
+		}
+	}
+	if pxeErr != nil && !pxeDone {
+		if err := <-pxeErr; err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }

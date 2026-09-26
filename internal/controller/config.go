@@ -25,6 +25,7 @@ type Config struct {
 	StateDir      string           `json:"state_dir"`
 	AdminToken    string           `json:"admin_token"`
 	Nodes         []NodeCredential `json:"nodes"`
+	PXE           *PXEConfig       `json:"pxe,omitempty"`
 }
 
 // NodeCredential binds one agent bearer token to one node ID.
@@ -127,6 +128,11 @@ func (c Config) Validate() error {
 			return errors.New("node tokens must be unique")
 		}
 		tokens[hash] = struct{}{}
+	}
+	if c.PXE != nil {
+		if err := c.PXE.Validate(c.Nodes); err != nil {
+			return err
+		}
 	}
 	return nil
 }

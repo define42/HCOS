@@ -86,6 +86,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y openssl shellcheck qemu-system-x86 ovmf
 
+      - name: Install iPXE build tools
+        if: ${{ hashFiles('scripts/build-ipxe.sh') != '' }}
+        run: sudo apt-get install --no-install-recommends -y build-essential liblzma-dev mtools xz-utils perl
+
       - name: Check scripts
         run: make check
 
@@ -95,6 +99,13 @@ jobs:
       - name: Build HCOS Go components
         if: ${{ hashFiles('go.mod') != '' }}
         run: make components
+
+      - name: Build iPXE UEFI loader
+        if: ${{ hashFiles('scripts/build-ipxe.sh') != '' }}
+        run: |
+          make ipxe
+          test -s dist/bootx64.efi
+          test -s dist/ipxe-source.tar.gz
 
       - name: Verify EFI contents
         run: make verify
@@ -113,6 +124,10 @@ jobs:
         if: ${{ hashFiles('go.mod') != '' }}
         run: make smoke-control-plane
 
+      - name: Exercise controller PXE services
+        if: ${{ hashFiles('scripts/build-ipxe.sh') != '' }}
+        run: make smoke-pxe
+
       - name: Upload build files
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -122,6 +137,8 @@ jobs:
             dist/hcos-server
             dist/hcos-controller
             dist/hcos-agent
+            dist/bootx64.efi
+            dist/ipxe-source.tar.gz
           compression-level: 0
           if-no-files-found: error
           retention-days: 14
@@ -157,6 +174,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y openssl shellcheck qemu-system-x86 ovmf
 
+      - name: Install iPXE build tools
+        if: ${{ hashFiles('scripts/build-ipxe.sh') != '' }}
+        run: sudo apt-get install --no-install-recommends -y build-essential liblzma-dev mtools xz-utils perl
+
       - name: Check scripts
         run: make check
 
@@ -166,6 +187,13 @@ jobs:
       - name: Build HCOS Go components
         if: ${{ hashFiles('go.mod') != '' }}
         run: make components
+
+      - name: Build iPXE UEFI loader
+        if: ${{ hashFiles('scripts/build-ipxe.sh') != '' }}
+        run: |
+          make ipxe
+          test -s dist/bootx64.efi
+          test -s dist/ipxe-source.tar.gz
 
       - name: Verify EFI contents
         run: make verify
@@ -184,6 +212,10 @@ jobs:
         if: ${{ hashFiles('go.mod') != '' }}
         run: make smoke-control-plane
 
+      - name: Exercise controller PXE services
+        if: ${{ hashFiles('scripts/build-ipxe.sh') != '' }}
+        run: make smoke-pxe
+
       - name: Publish immutable GitHub release asset
         shell: bash
         env:
@@ -193,9 +225,9 @@ jobs:
           set -euo pipefail
           tag="hcos-${COMMIT_SHA}"
           assets=(dist/hcos-base.efi)
-          for binary in dist/hcos-server dist/hcos-controller dist/hcos-agent; do
-            if [[ -f "$binary" ]]; then
-              assets+=("$binary")
+          for asset in dist/hcos-server dist/hcos-controller dist/hcos-agent dist/bootx64.efi dist/ipxe-source.tar.gz; do
+            if [[ -s "$asset" ]]; then
+              assets+=("$asset")
             fi
           done
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -211,7 +243,7 @@ jobs:
           else
             gh release create "$tag" "${assets[@]}" \
               --latest=false \
-              --notes "HCOS EFI and components built and tested from commit ${COMMIT_SHA}." \
+              --notes "HCOS boot images and components built and tested from commit ${COMMIT_SHA}." \
               --repo "$GITHUB_REPOSITORY" \
               --target "$COMMIT_SHA" \
               --title "HCOS ${COMMIT_SHA:0:12}"

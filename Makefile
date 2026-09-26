@@ -1,11 +1,14 @@
-.PHONY: build components check verify smoke smoke-injected smoke-server smoke-control-plane
+.PHONY: build ipxe components check verify smoke smoke-injected smoke-server smoke-control-plane smoke-pxe
 
 build:
 	./scripts/build.sh
 
+ipxe:
+	./scripts/build-ipxe.sh
+
 check:
 	./scripts/check.sh
-	python3 -m py_compile scripts/verify-image.py scripts/smoke-test.py scripts/test-injection.py scripts/test-server.py scripts/test-control-plane.py
+	python3 -m py_compile scripts/verify-image.py scripts/smoke-test.py scripts/test-injection.py scripts/test-server.py scripts/test-control-plane.py scripts/test-pxe.py
 	go test -race ./...
 	go vet ./...
 
@@ -29,3 +32,6 @@ smoke-server:
 
 smoke-control-plane: components
 	python3 scripts/test-control-plane.py
+
+smoke-pxe: components
+	python3 scripts/test-pxe.py
