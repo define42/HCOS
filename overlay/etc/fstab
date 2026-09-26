@@ -1,0 +1,1 @@
+# HCOS starts from its embedded RAM root. Mount persistent VM storage explicitly.

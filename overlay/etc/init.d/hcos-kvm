@@ -1,0 +1,13 @@
+#!/sbin/openrc-run
+# shellcheck disable=SC2034
+description="Load the KVM module for the host CPU"
+
+start() {
+    ebegin "Loading KVM"
+    if modprobe kvm_intel 2>/dev/null || modprobe kvm_amd 2>/dev/null; then
+        eend 0
+    else
+        ewarn "KVM unavailable on this host; QEMU can still use software emulation"
+        eend 0
+    fi
+}

@@ -1,0 +1,39 @@
+#!/bin/sh
+# Adapted from NetDesk's Apache-2.0 RAM-root init for HCOS.
+set -eu
+
+boot_failed() {
+    printf '%s\n' 'HCOS could not initialize its RAM root.' > /dev/console
+    while :; do sleep 3600; done
+}
+trap boot_failed EXIT
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Give rootfs a parent mount so libvirt/QEMU can create private mount namespaces.
+if [ "${1:-}" != --root-mounted ]; then
+    mkdir -p /newroot
+    mount --bind / /newroot
+    cd /newroot
+    mount --move . /
+    exec chroot . /init --root-mounted
+fi
+rmdir /newroot
+
+mkdir -p /proc /sys /dev /run /tmp
+mount -t proc -o nosuid,nodev,noexec proc /proc
+mount -t sysfs -o nosuid,nodev,noexec sysfs /sys
+mkdir -p /sys/fs/cgroup
+mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup
+mount -t devtmpfs -o nosuid,mode=0755 devtmpfs /dev
+mkdir -p /dev/pts /dev/shm
+mount -t devpts -o nosuid,noexec,gid=5,mode=0620,ptmxmode=0666 devpts /dev/pts
+mount -t tmpfs -o nosuid,nodev,mode=0755,size=64m tmpfs /run
+mount -t tmpfs -o nosuid,nodev,mode=1777,size=25% tmpfs /tmp
+mount -t tmpfs -o nosuid,nodev,noexec,mode=1777,size=25% tmpfs /dev/shm
+ln -sf /proc/self/fd /dev/fd
+ln -sf /proc/self/fd/0 /dev/stdin
+ln -sf /proc/self/fd/1 /dev/stdout
+ln -sf /proc/self/fd/2 /dev/stderr
+mkdir -p /run/openrc
+
+exec /sbin/init

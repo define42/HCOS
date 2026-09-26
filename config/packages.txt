@@ -1,0 +1,16 @@
+# Alpine packages in the deployed RAM root. Dependencies are installed by apk.
+alpine-base
+linux-lts
+linux-firmware-none
+linux-firmware-rtl_nic
+kmod
+eudev
+eudev-openrc
+dhcpcd
+dhcpcd-openrc
+iproute2
+dnsmasq
+qemu-system-x86_64
+qemu-img
+libvirt-qemu
+libvirt-daemon-openrc

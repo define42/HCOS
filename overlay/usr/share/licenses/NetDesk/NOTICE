@@ -1,0 +1,6 @@
+HCOS adapts NetDesk's Alpine Unified Kernel Image build and RAM-root boot design.
+Source: https://github.com/define42/NetDesk/tree/83c7d1a4ac93ba72ebcac305678917aa524b72df
+License: Apache License 2.0 (see LICENSE in this directory).
+
+HCOS changes the embedded runtime to an x86_64 QEMU/libvirt host, selects and
+prunes KVM/host modules, and adds runtime/image verification.

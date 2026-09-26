@@ -1,0 +1,28 @@
+# KVM for both x86 CPU vendors.
+kvm_intel
+kvm_amd
+# Host bridge, TAP and accelerated guest networking.
+tun
+bridge
+br_netfilter
+veth
+vhost_net
+macvtap
+# Common storage pools and disk controllers.
+ext4
+xfs
+vfat
+dm_mod
+nvme
+ahci
+sd_mod
+usb_storage
+# Booting HCOS itself on virtio or common wired x86 hosts.
+virtio_pci
+virtio_net
+virtio_blk
+virtio_scsi
+e1000e
+igc
+ixgbe
+r8169

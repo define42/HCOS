@@ -1,0 +1,24 @@
+#!/sbin/openrc-run
+# shellcheck disable=SC2034
+description="Check the HCOS virtualization runtime"
+
+depend() {
+    need libvirtd
+    after hcos-kvm dhcpcd
+}
+
+start() {
+    ebegin "Checking QEMU and libvirt"
+    qemu-system-x86_64 --version >/dev/null 2>&1 || { eend 1; return 1; }
+    qemu-img --version >/dev/null 2>&1 || { eend 1; return 1; }
+    count=0
+    until virsh -c qemu:///system list --all >/dev/null 2>&1 &&
+          virsh -c qemu:///system net-list --name 2>/dev/null | grep -Fxq default &&
+          virsh -c qemu:///system pool-list --all >/dev/null 2>&1; do
+        count=$((count + 1))
+        [ "$count" -lt 30 ] || { eend 1; return 1; }
+        sleep 1
+    done
+    eend 0
+    printf '%s\n' 'HCOS virtualization ready' > /dev/console
+}
