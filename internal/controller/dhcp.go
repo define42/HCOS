@@ -28,7 +28,7 @@ type DHCPConfig struct {
 	LeaseSeconds  uint32      `json:"lease_seconds,omitempty"`
 	BootFile      string      `json:"boot_file,omitempty"`
 	IPXEBootFile  string      `json:"ipxe_boot_file,omitempty"`
-	Leases        []DHCPLease `json:"leases"`
+	Leases        []DHCPLease `json:"-"`
 }
 
 // DHCPLease grants a single, pre-authorized machine a fixed IPv4 address.

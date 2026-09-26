@@ -33,16 +33,7 @@ func testServer(t *testing.T, logger *slog.Logger) (*Server, Config, Node) {
 		CacheDir:  filepath.Join(directory, "cache"),
 		NodesFile: filepath.Join(directory, "nodes.json"),
 	}
-	node := Node{
-		ID: "node-01", BootToken: "test-boot-token-with-more-than-32-bytes",
-		HCOSVersion: "1.0.0", AgentVersion: "1.0.0", CAVersion: "site-v1",
-		Config: protocol.AgentConfig{
-			APIVersion: protocol.APIVersion, NodeID: "node-01", Hostname: "node-01",
-			Controller: "https://controller.internal", ControllerToken: "private-controller-token",
-			Storage: protocol.Storage{Path: "/vm-storage"},
-			Network: protocol.Network{ManagementInterface: "eth0", VMBridge: "br-vm"},
-		},
-	}
+	node := testNode()
 	base, agent, ca := config.paths(node)
 	for _, path := range []string{base, agent, ca} {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -72,6 +63,19 @@ func testServer(t *testing.T, logger *slog.Logger) (*Server, Config, Node) {
 	return server, config, node
 }
 
+func testNode() Node {
+	return Node{
+		ID:          "node-01",
+		HCOSVersion: "1.0.0", AgentVersion: "1.0.0", CAVersion: "site-v1",
+		Config: protocol.AgentConfig{
+			APIVersion: protocol.APIVersion, NodeID: "node-01", Hostname: "node-01",
+			Controller: "https://controller.internal", ControllerToken: "private-node-token-with-more-than-32-bytes",
+			Storage: protocol.Storage{Path: "/vm-storage"},
+			Network: protocol.Network{ManagementInterface: "eth0", VMBridge: "br-vm"},
+		},
+	}
+}
+
 func testCA(t *testing.T) []byte {
 	t.Helper()
 	public, private, err := ed25519.GenerateKey(rand.Reader)
@@ -98,7 +102,7 @@ func testCA(t *testing.T) []byte {
 }
 
 func bootURL(node Node) string {
-	return "/boot/hcos.efi?node=" + url.QueryEscape(node.ID) + "&token=" + url.QueryEscape(node.BootToken)
+	return "/boot/hcos.efi?node=" + url.QueryEscape(node.ID) + "&token=" + url.QueryEscape(node.Config.ControllerToken)
 }
 
 func cacheEntries(t *testing.T, directory string) int {
@@ -140,7 +144,7 @@ func TestServerBootAndCache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Contains(initrd, []byte("private-controller-token")) || !bytes.Contains(initrd, []byte("usr/local/bin/hcos-agent")) {
+	if !bytes.Contains(initrd, []byte(node.Config.ControllerToken)) || !bytes.Contains(initrd, []byte("usr/local/bin/hcos-agent")) {
 		t.Fatal("node configuration or agent missing from initramfs")
 	}
 	if cacheEntries(t, config.CacheDir) != 1 {
@@ -176,7 +180,7 @@ func TestServerBootAndCache(t *testing.T) {
 	if !strings.Contains(logs.String(), `"cache":"hit"`) {
 		t.Fatal("cache hit was not audited")
 	}
-	if strings.Contains(logs.String(), node.BootToken) || strings.Contains(logs.String(), node.Config.ControllerToken) {
+	if strings.Contains(logs.String(), node.Config.ControllerToken) {
 		t.Fatal("secret leaked into audit log")
 	}
 
@@ -223,21 +227,84 @@ func TestServerBootAndCache(t *testing.T) {
 }
 
 func TestServerRejectsUnauthorizedRequests(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
 	server, config, node := testServer(t, logger)
+	other := node
+	other.ID, other.Config.NodeID = "node-02", "node-02"
+	other.Config.ControllerToken = "different-node-token-with-more-than-32-bytes"
+	writeTestNodes(t, config.NodesFile, node, other)
 	for _, path := range []string{
 		"/hcos.efi?node=node-01&token=wrong",
-		"/boot/hcos.efi?node=unknown&token=" + node.BootToken,
-		"/boot/hcos.efi?node=node-01&token=" + node.BootToken + "&token=duplicate",
+		"/boot/hcos.efi?node=node-01",
+		"/boot/hcos.efi?node=unknown&token=" + url.QueryEscape(node.Config.ControllerToken),
+		bootURL(node) + "&token=duplicate",
+		"/boot/hcos.efi?node=node-02&token=" + url.QueryEscape(node.Config.ControllerToken),
+		"/boot/hcos.efi?node=node-01&token=" + url.QueryEscape(other.Config.ControllerToken),
 	} {
 		record := httptest.NewRecorder()
 		server.Handler().ServeHTTP(record, httptest.NewRequest(http.MethodGet, path, nil))
 		if record.Code != http.StatusForbidden {
-			t.Fatalf("%s: status %d", path, record.Code)
+			t.Fatalf("unauthorized request returned status %d", record.Code)
 		}
 	}
 	if cacheEntries(t, config.CacheDir) != 0 {
 		t.Fatal("unauthorized request built an image")
+	}
+	for _, authorized := range []Node{node, other} {
+		record := httptest.NewRecorder()
+		server.Handler().ServeHTTP(record, httptest.NewRequest(http.MethodGet, bootURL(authorized), nil))
+		if record.Code != http.StatusOK {
+			t.Fatalf("authorized node %q returned status %d", authorized.ID, record.Code)
+		}
+		initrd, err := InitrdSection(record.Body.Bytes())
+		if err != nil || !bytes.Contains(initrd, []byte(authorized.Config.ControllerToken)) {
+			t.Fatalf("downloaded image must embed the credential used to authenticate: %v", err)
+		}
+		if strings.Contains(logs.String(), authorized.Config.ControllerToken) {
+			t.Fatal("node token leaked into audit log")
+		}
+	}
+	if cacheEntries(t, config.CacheDir) != 2 {
+		t.Fatal("expected a separate personalized EFI for each node")
+	}
+}
+
+func TestServerTokenRotationChangesDownloadAndAgentCredential(t *testing.T) {
+	t.Parallel()
+	server, config, node := testServer(t, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
+	first := httptest.NewRecorder()
+	server.Handler().ServeHTTP(first, httptest.NewRequest(http.MethodGet, bootURL(node), nil))
+	if first.Code != http.StatusOK {
+		t.Fatalf("initial download returned %d", first.Code)
+	}
+	oldURL, oldToken := bootURL(node), node.Config.ControllerToken
+	node.Config.ControllerToken = strings.Repeat("!?&+/%#=", 64)
+	writeTestNodes(t, config.NodesFile, node)
+	denied := httptest.NewRecorder()
+	server.Handler().ServeHTTP(denied, httptest.NewRequest(http.MethodGet, oldURL, nil))
+	if denied.Code != http.StatusForbidden {
+		t.Fatalf("old token returned %d", denied.Code)
+	}
+	updated := httptest.NewRecorder()
+	server.Handler().ServeHTTP(updated, httptest.NewRequest(http.MethodGet, bootURL(node), nil))
+	if updated.Code != http.StatusOK {
+		t.Fatalf("new token returned %d", updated.Code)
+	}
+	initrd, err := InitrdSection(updated.Body.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// JSON escapes reserved characters such as '&'; match the encoded secret.
+	encodedToken, err := json.Marshal(node.Config.ControllerToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(initrd, encodedToken) || bytes.Contains(initrd, []byte(oldToken)) {
+		t.Fatal("token rotation did not replace the injected agent credential")
+	}
+	if cacheEntries(t, config.CacheDir) != 2 || bytes.Equal(first.Body.Bytes(), updated.Body.Bytes()) {
+		t.Fatal("token rotation did not create a fresh personalized image")
 	}
 }
 

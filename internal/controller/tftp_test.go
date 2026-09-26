@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -298,15 +300,28 @@ func fetchTFTPFrom(t *testing.T, address *net.UDPAddr, name string, blockSize in
 }
 
 func TestTFTPServesOnlyRequestingNodesScript(t *testing.T) {
-	config := testConfig(t)
-	pxe := testPXEConfig(t, "http://127.0.0.1:8080")
-	pxe.DHCP.Leases = append(pxe.DHCP.Leases, DHCPLease{
-		NodeID: "compute-02", MAC: "52:54:00:12:34:57", IP: "127.0.0.3",
-	})
+	config := testConfigWithPXE(t)
+	config.Nodes[1].MAC, config.Nodes[1].IP = "52:54:00:12:34:57", "127.0.0.3"
 	const special = "?+$;${variable}/=#%"
-	pxe.BootTokens["compute-02"] = strings.Repeat("&", 512-len(special)) + special
-	config.PXE = &pxe
-	server, err := NewTFTPServer(config.RuntimePXE().TFTP)
+	config.Nodes[1].Token = strings.Repeat("&", 512-len(special)) + special
+	data, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "controller.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	config, err = LoadConfig(path)
+	if err != nil {
+		t.Fatalf("consolidated node JSON rejected: %v", err)
+	}
+	runtime := config.RuntimePXE()
+	dhcp, err := NewDHCPServer(runtime.DHCP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewTFTPServer(runtime.TFTP)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -315,11 +330,30 @@ func TestTFTPServesOnlyRequestingNodesScript(t *testing.T) {
 		cancel()
 		awaitTFTPShutdown(t, done)
 	})
-	for _, tc := range []struct{ ip, node, path string }{
-		{"127.0.0.2", "compute-01", "boot.ipxe"},
-		{"127.0.0.3", "compute-02", "boot/boot.ipxe"},
-	} {
-		script := string(fetchTFTPFrom(t, address, tc.path, 512, false, tc.ip))
+	api := testHandler(t, config)
+	for index, node := range config.Nodes {
+		mac, err := net.ParseMAC(node.MAC)
+		if err != nil {
+			t.Fatal(err)
+		}
+		discover := testDHCPRequest(1, 93, 2, 0, 9)
+		copy(discover[28:34], mac)
+		offer, ok := dhcp.HandlePacket(discover)
+		if !ok || offer.NodeID != node.ID {
+			t.Fatalf("DHCP did not identify node %s from its configured MAC", node.ID)
+		}
+		assignedIP := net.IP(offer.Packet[16:20]).String()
+		if assignedIP != node.IP {
+			t.Fatalf("node %s offered IP %s, want %s", node.ID, assignedIP, node.IP)
+		}
+		if got := string(testDHCPOptions(t, offer.Packet)[67]); got != "bootx64.efi" {
+			t.Fatalf("DHCP firmware boot file = %q", got)
+		}
+		name := "boot.ipxe"
+		if index == 1 {
+			name = "boot/boot.ipxe"
+		}
+		script := string(fetchTFTPFrom(t, address, name, 512, false, assignedIP))
 		if !strings.HasPrefix(script, "#!ipxe\nchain ") || strings.Count(script, "\n") != 2 {
 			t.Fatalf("script contains unexpected commands: %q", script)
 		}
@@ -327,15 +361,24 @@ func TestTFTPServesOnlyRequestingNodesScript(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if target.Scheme != "http" || target.Host != config.ServerIP || target.Path != "/boot/hcos.efi" || target.Fragment != "" || target.Query().Get("node") != tc.node || target.Query().Get("token") != pxe.BootTokens[tc.node] || len(target.Query()) != 2 {
+		if target.Scheme != "http" || target.Host != config.ServerIP || target.Path != "/boot/hcos.efi" || target.Fragment != "" || target.Query().Get("node") != node.ID || target.Query().Get("token") != node.Token || len(target.Query()) != 2 {
 			t.Fatal("script did not preserve the requesting node's URL and credentials")
 		}
-		if tc.node == "compute-02" && len(script) <= 1024 {
+		response := request(api, http.MethodGet, "/v1/nodes/"+node.ID+"/desired", target.Query().Get("token"), nil)
+		if response.Code != http.StatusOK {
+			t.Fatalf("TFTP script token could not authenticate node %s: HTTP %d", node.ID, response.Code)
+		}
+		if index == 1 && len(script) <= 1024 {
 			t.Fatal("maximum encoded token did not exercise multiple transfer blocks")
 		}
 		if strings.Contains(script, "${") || strings.Contains(script, ";") {
 			t.Fatal("unescaped iPXE syntax in generated script")
 		}
+	}
+	unknownMAC := testDHCPRequest(1, 93, 2, 0, 9)
+	unknownMAC[33] = 0xff
+	if _, ok := dhcp.HandlePacket(unknownMAC); ok {
+		t.Fatal("unknown MAC received a DHCP lease")
 	}
 	unknown := newTFTPClientAt(t, "127.0.0.4")
 	if _, err := unknown.WriteToUDP(tftpRequestPacket(1, "boot.ipxe", "octet"), address); err != nil {
@@ -355,7 +398,7 @@ func TestTFTPServesOnlyRequestingNodesScript(t *testing.T) {
 func TestTFTPCancelClosesPendingScriptTransfer(t *testing.T) {
 	server, err := NewTFTPServer(TFTPConfig{
 		ListenAddress: "127.0.0.1:1069",
-		scripts:       map[string][]byte{"127.0.0.2": pxeBootScript("127.0.0.1", "compute-01", testPXEBootToken)},
+		scripts:       map[string][]byte{"127.0.0.2": pxeBootScript("127.0.0.1", "compute-01", testPXENodeToken)},
 	})
 	if err != nil {
 		t.Fatal(err)

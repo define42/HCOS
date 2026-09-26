@@ -2,6 +2,7 @@ package bootserver
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,7 +40,6 @@ type SigningConfig struct {
 
 type Node struct {
 	ID           string               `json:"id"`
-	BootToken    string               `json:"boot_token"`
 	HCOSVersion  string               `json:"hcos_version"`
 	AgentVersion string               `json:"agent_version"`
 	CAVersion    string               `json:"ca_version"`
@@ -150,6 +150,7 @@ func loadNodes(path string) (map[string]Node, error) {
 		return nil, errors.New("node configuration contains no nodes")
 	}
 	nodes := make(map[string]Node, len(data.Nodes))
+	tokens := make(map[[sha256.Size]byte]string, len(data.Nodes))
 	for _, node := range data.Nodes {
 		if err := node.validate(); err != nil {
 			return nil, fmt.Errorf("node %q: %w", node.ID, err)
@@ -157,6 +158,11 @@ func loadNodes(path string) (map[string]Node, error) {
 		if _, found := nodes[node.ID]; found {
 			return nil, fmt.Errorf("duplicate node %q", node.ID)
 		}
+		tokenHash := sha256.Sum256([]byte(node.Config.ControllerToken))
+		if other, found := tokens[tokenHash]; found {
+			return nil, fmt.Errorf("nodes %q and %q must have different config.controller_token values", other, node.ID)
+		}
+		tokens[tokenHash] = node.ID
 		nodes[node.ID] = node
 	}
 	return nodes, nil
@@ -166,8 +172,13 @@ func (n Node) validate() error {
 	if !nodeIDRE.MatchString(n.ID) || n.Config.NodeID != n.ID {
 		return errors.New("id must match config.node_id and contain only safe characters")
 	}
-	if len(n.BootToken) < 32 {
-		return errors.New("boot_token must contain at least 32 characters")
+	if len(n.Config.ControllerToken) < 32 || len(n.Config.ControllerToken) > 512 {
+		return errors.New("config.controller_token must contain 32 to 512 characters")
+	}
+	for _, character := range n.Config.ControllerToken {
+		if character < 0x21 || character > 0x7e {
+			return errors.New("config.controller_token must contain only printable non-space ASCII characters")
+		}
 	}
 	for name, version := range map[string]string{
 		"hcos_version":  n.HCOSVersion,
@@ -181,8 +192,8 @@ func (n Node) validate() error {
 	if n.Config.APIVersion != protocol.APIVersion {
 		return fmt.Errorf("config.api_version must be %q", protocol.APIVersion)
 	}
-	if n.Config.Hostname == "" || n.Config.Controller == "" || n.Config.ControllerToken == "" {
-		return errors.New("config.hostname, controller and controller_token are required")
+	if n.Config.Hostname == "" || n.Config.Controller == "" {
+		return errors.New("config.hostname and controller are required")
 	}
 	if n.Config.Storage.Path != "" && !filepath.IsAbs(n.Config.Storage.Path) {
 		return errors.New("config.storage.path must be absolute when set")

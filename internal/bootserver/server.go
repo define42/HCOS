@@ -285,7 +285,7 @@ func (s *Server) resolveNode(r *http.Request) (string, Node, error) {
 	node, found := nodes[ids[0]]
 	expected := "unavailable-node-placeholder-token-00000000"
 	if found {
-		expected = node.BootToken
+		expected = node.Config.ControllerToken
 	}
 	presentedHash := sha256.Sum256([]byte(tokens[0]))
 	expectedHash := sha256.Sum256([]byte(expected))

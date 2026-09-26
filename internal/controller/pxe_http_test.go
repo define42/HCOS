@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-const testPXEBootToken = "boot-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+const testPXENodeToken = "node-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 func testPXEConfig(t *testing.T, bootURL string) PXEConfig {
 	t.Helper()
@@ -27,7 +27,7 @@ func testPXEConfig(t *testing.T, bootURL string) PXEConfig {
 		TFTP: TFTPConfig{
 			ListenAddress: "127.0.0.1:1069",
 		},
-		BootTokens: map[string]string{"compute-01": testPXEBootToken},
+		NodeTokens: map[string]string{"compute-01": testPXENodeToken},
 	}
 }
 
@@ -40,9 +40,11 @@ func requestPXE(handler http.Handler, method, path, remote string) *httptest.Res
 }
 
 func TestPXEHTTPProxiesOnlyKnownNodeWithoutExposingToken(t *testing.T) {
+	const special = "?+$;${variable}/=#%"
+	token := strings.Repeat("&", 512-len(special)) + special
 	image := []byte("MZpersonalized-efi")
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/boot/hcos.efi" || r.URL.Query().Get("node") != "compute-01" || r.URL.Query().Get("token") != testPXEBootToken {
+		if r.URL.Path != "/boot/hcos.efi" || r.URL.Query().Get("node") != "compute-01" || r.URL.Query().Get("token") != token {
 			http.Error(w, "wrong boot identity", http.StatusForbidden)
 			return
 		}
@@ -52,9 +54,19 @@ func TestPXEHTTPProxiesOnlyKnownNodeWithoutExposingToken(t *testing.T) {
 		}
 	}))
 	defer upstream.Close()
-	config := testPXEConfig(t, upstream.URL)
-	if err := config.Validate([]NodeCredential{{ID: "compute-01", Token: strings.Repeat("n", 64)}}); err != nil {
+	controller := testConfigWithPXE(t)
+	controller.Nodes[0].Token = token
+	config := *controller.RuntimePXE()
+	config.HTTPListenAddress = "127.0.0.1:18080"
+	config.BootServerURL = upstream.URL
+	config.BootCAFile = ""
+	if err := config.Validate(controller.Nodes); err != nil {
 		t.Fatalf("PXE config rejected: %v", err)
+	}
+	api := testHandler(t, controller)
+	desired := request(api, http.MethodGet, "/v1/nodes/compute-01/desired", token, nil)
+	if desired.Code != http.StatusOK {
+		t.Fatalf("shared token could not authenticate to controller API: HTTP %d", desired.Code)
 	}
 	handler, err := NewPXEHandler(config)
 	if err != nil {
@@ -64,8 +76,8 @@ func TestPXEHTTPProxiesOnlyKnownNodeWithoutExposingToken(t *testing.T) {
 	if script.Code != http.StatusOK || !bytes.HasPrefix(script.Body.Bytes(), []byte("#!ipxe\n")) || !bytes.Contains(script.Body.Bytes(), []byte("http://127.0.0.1:18080/boot/hcos.efi")) {
 		t.Fatalf("unexpected iPXE script: status %d, body %q", script.Code, script.Body.String())
 	}
-	if bytes.Contains(script.Body.Bytes(), []byte(testPXEBootToken)) {
-		t.Fatal("iPXE script disclosed boot token")
+	if bytes.Contains(script.Body.Bytes(), []byte(token)) {
+		t.Fatal("HTTP iPXE script disclosed node token")
 	}
 	got := requestPXE(handler, http.MethodGet, "http://127.0.0.1/boot/hcos.efi", "127.0.0.2:1234")
 	if got.Code != http.StatusOK || !bytes.Equal(got.Body.Bytes(), image) {
@@ -124,7 +136,7 @@ func TestPXEHTTPValidatesBootServerCA(t *testing.T) {
 
 func TestPXERejectsMismatchedBootAssets(t *testing.T) {
 	base := testPXEConfig(t, "http://127.0.0.1:8080")
-	nodes := []NodeCredential{{ID: "compute-01", Token: strings.Repeat("n", 64)}}
+	nodes := []NodeCredential{{ID: "compute-01", Token: testPXENodeToken}}
 	for _, test := range []struct {
 		name string
 		edit func(*PXEConfig)
@@ -132,7 +144,10 @@ func TestPXERejectsMismatchedBootAssets(t *testing.T) {
 		{"wrong TFTP IP", func(p *PXEConfig) { p.TFTP.ListenAddress = "127.0.0.2:1069" }},
 		{"wrong DHCP boot file", func(p *PXEConfig) { p.DHCP.BootFile = "other.efi" }},
 		{"wrong iPXE target", func(p *PXEConfig) { p.DHCP.IPXEBootFile = "http://127.0.0.1/other" }},
-		{"missing token", func(p *PXEConfig) { p.BootTokens = map[string]string{} }},
+		{"missing token", func(p *PXEConfig) { p.NodeTokens = map[string]string{} }},
+		{"different node token", func(p *PXEConfig) {
+			p.NodeTokens = map[string]string{"compute-01": strings.Repeat("n", 64)}
+		}},
 		{"external HTTP bootserver", func(p *PXEConfig) { p.BootServerURL = "http://192.0.2.10" }},
 	} {
 		t.Run(test.name, func(t *testing.T) {

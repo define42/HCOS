@@ -126,18 +126,29 @@ func TestLoadConfigRejectsUnsafeFile(t *testing.T) {
 	}
 }
 
-func TestConfigDerivesFixedServiceAddresses(t *testing.T) {
+func testConfigWithPXE(t *testing.T) Config {
+	t.Helper()
 	config := testConfig(t)
-	pxe := testPXEConfig(t, "http://127.0.0.1:8080")
-	config.PXE = &pxe
+	config.Nodes[0].MAC = "52:54:00:12:34:56"
+	config.Nodes[0].IP = "127.0.0.2"
+	config.PXE = &PXEConfig{
+		BootCAFile: filepath.Join(t.TempDir(), "boot-ca.pem"),
+		DHCP:       DHCPConfig{Interface: "lo", SubnetMask: "255.0.0.0"},
+	}
+	return config
+}
+
+func TestConfigDerivesFixedServiceAddresses(t *testing.T) {
+	config := testConfigWithPXE(t)
+	config.PXE.BootCAFile = ""
 	if err := config.Validate(); err == nil || !strings.Contains(err.Error(), "boot_ca_file") {
 		t.Fatalf("PXE without an HTTPS boot CA: got %v, want boot_ca_file error", err)
 	}
 	upstream := httptest.NewTLSServer(http.NotFoundHandler())
 	defer upstream.Close()
-	pxe.BootCAFile = filepath.Join(t.TempDir(), "boot-ca.pem")
+	config.PXE.BootCAFile = filepath.Join(t.TempDir(), "boot-ca.pem")
 	certificate := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: upstream.Certificate().Raw})
-	if err := os.WriteFile(pxe.BootCAFile, certificate, 0o600); err != nil {
+	if err := os.WriteFile(config.PXE.BootCAFile, certificate, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := config.Validate(); err != nil {
@@ -195,11 +206,8 @@ func TestConfigDerivesFixedServiceAddresses(t *testing.T) {
 	}
 }
 
-func TestLoadConfigRejectsLegacyAddressFields(t *testing.T) {
-	config := testConfig(t)
-	pxe := testPXEConfig(t, "http://127.0.0.1:8080")
-	pxe.BootCAFile = filepath.Join(t.TempDir(), "boot-ca.pem")
-	config.PXE = &pxe
+func TestLoadConfigRejectsLegacyFields(t *testing.T) {
+	config := testConfigWithPXE(t)
 	base, err := json.Marshal(config)
 	if err != nil {
 		t.Fatal(err)
@@ -223,11 +231,13 @@ func TestLoadConfigRejectsLegacyAddressFields(t *testing.T) {
 		name  string
 		path  []string
 		field string
-		value string
+		value any
 	}{
 		{name: "controller listen_address", field: "listen_address", value: "127.0.0.1:9443"},
 		{name: "PXE http_listen_address", path: []string{"pxe"}, field: "http_listen_address", value: "127.0.0.1:80"},
 		{name: "PXE boot_server_url", path: []string{"pxe"}, field: "boot_server_url", value: "https://127.0.0.1:8443"},
+		{name: "PXE boot_tokens", path: []string{"pxe"}, field: "boot_tokens", value: map[string]string{"compute-01": testPXENodeToken}},
+		{name: "DHCP leases", path: []string{"pxe", "dhcp"}, field: "leases", value: []DHCPLease{{NodeID: "compute-01", MAC: "52:54:00:12:34:56", IP: "127.0.0.2"}}},
 		{name: "DHCP listen_address", path: []string{"pxe", "dhcp"}, field: "listen_address", value: "0.0.0.0:67"},
 		{name: "DHCP server_ip", path: []string{"pxe", "dhcp"}, field: "server_ip", value: "127.0.0.1"},
 		{name: "DHCP next_server_ip", path: []string{"pxe", "dhcp"}, field: "next_server_ip", value: "127.0.0.1"},
@@ -257,8 +267,114 @@ func TestLoadConfigRejectsLegacyAddressFields(t *testing.T) {
 			}
 			_, err = LoadConfig(path)
 			if err == nil || !strings.Contains(err.Error(), "unknown field") {
-				t.Fatalf("legacy address field %q: got %v, want unknown field error", tc.field, err)
+				t.Fatalf("legacy field %q: got %v, want unknown field error", tc.field, err)
 			}
 		})
+	}
+}
+
+func TestConfigValidatesConsolidatedNodes(t *testing.T) {
+	cases := []struct {
+		name string
+		edit func(*Config)
+	}{
+		{name: "PXE fields without PXE enabled", edit: func(c *Config) { c.PXE = nil }},
+		{name: "missing MAC", edit: func(c *Config) { c.Nodes[0].MAC = "" }},
+		{name: "missing IP", edit: func(c *Config) { c.Nodes[0].IP = "" }},
+		{name: "no PXE nodes", edit: func(c *Config) {
+			c.Nodes[0].MAC, c.Nodes[0].IP = "", ""
+		}},
+		{name: "short node token", edit: func(c *Config) { c.Nodes[0].Token = "short" }},
+		{name: "long node token", edit: func(c *Config) { c.Nodes[0].Token = strings.Repeat("b", 513) }},
+		{name: "whitespace node token", edit: func(c *Config) { c.Nodes[0].Token += "\n" }},
+		{name: "node token reused as admin", edit: func(c *Config) { c.Nodes[0].Token = c.AdminToken }},
+		{name: "node token reused as another agent", edit: func(c *Config) { c.Nodes[0].Token = c.Nodes[1].Token }},
+		{name: "invalid MAC", edit: func(c *Config) { c.Nodes[0].MAC = "invalid" }},
+		{name: "multicast MAC", edit: func(c *Config) { c.Nodes[0].MAC = "01:00:5e:12:34:56" }},
+		{name: "non-Ethernet MAC", edit: func(c *Config) { c.Nodes[0].MAC = "52:54:00:12:34:56:78:90" }},
+		{name: "invalid IP", edit: func(c *Config) { c.Nodes[0].IP = "invalid" }},
+		{name: "IPv6 IP", edit: func(c *Config) { c.Nodes[0].IP = "::2" }},
+		{name: "server IP as node IP", edit: func(c *Config) { c.Nodes[0].IP = c.ServerIP }},
+		{name: "IP outside subnet", edit: func(c *Config) { c.Nodes[0].IP = "192.0.2.2" }},
+		{name: "network IP", edit: func(c *Config) { c.Nodes[0].IP = "127.0.0.0" }},
+		{name: "broadcast IP", edit: func(c *Config) { c.Nodes[0].IP = "127.255.255.255" }},
+		{name: "duplicate MAC", edit: func(c *Config) {
+			c.Nodes[1].MAC, c.Nodes[1].IP = c.Nodes[0].MAC, "127.0.0.3"
+		}},
+		{name: "duplicate MAC in another notation", edit: func(c *Config) {
+			c.Nodes[1].MAC, c.Nodes[1].IP = "52-54-00-12-34-56", "127.0.0.3"
+		}},
+		{name: "duplicate IP", edit: func(c *Config) {
+			c.Nodes[1].MAC, c.Nodes[1].IP = "52:54:00:12:34:57", c.Nodes[0].IP
+		}},
+		{name: "duplicate PXE node token", edit: func(c *Config) {
+			c.Nodes[1].Token = c.Nodes[0].Token
+			c.Nodes[1].MAC, c.Nodes[1].IP = "52:54:00:12:34:57", "127.0.0.3"
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			config := testConfigWithPXE(t)
+			if err := config.Validate(); err != nil {
+				t.Fatalf("valid fixture rejected: %v", err)
+			}
+			tc.edit(&config)
+			if err := config.Validate(); err == nil {
+				t.Fatal("invalid consolidated node configuration accepted")
+			}
+		})
+	}
+}
+
+func TestConfigAcceptsAPINodesWithoutPXEFields(t *testing.T) {
+	config := testConfig(t)
+	if err := config.Validate(); err != nil {
+		t.Fatalf("API-only configuration rejected: %v", err)
+	}
+	if config.RuntimePXE() != nil {
+		t.Fatal("API-only configuration enabled PXE services")
+	}
+	config = testConfigWithPXE(t)
+	if err := config.Validate(); err != nil {
+		t.Fatalf("mixed API and PXE nodes rejected: %v", err)
+	}
+	runtime := config.RuntimePXE()
+	if len(runtime.DHCP.Leases) != 1 || runtime.DHCP.Leases[0].NodeID != config.Nodes[0].ID {
+		t.Fatal("API-only node received a DHCP lease")
+	}
+	if _, found := runtime.NodeTokens[config.Nodes[1].ID]; found {
+		t.Fatal("API-only node received a PXE token mapping")
+	}
+	handler := testHandler(t, config)
+	for _, node := range config.Nodes {
+		response := request(handler, http.MethodGet, "/v1/nodes/"+node.ID+"/desired", node.Token, nil)
+		if response.Code != http.StatusOK {
+			t.Fatalf("node %s could not authenticate to controller: HTTP %d", node.ID, response.Code)
+		}
+	}
+}
+
+func TestLoadConfigRejectsSeparateNodeBootToken(t *testing.T) {
+	config := testConfigWithPXE(t)
+	data, err := json.Marshal(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	node := document["nodes"].([]any)[0].(map[string]any)
+	node["boot_token"] = node["token"]
+	data, err = json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "controller.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), `unknown field "boot_token"`) {
+		t.Fatalf("separate boot_token: got %v, want unknown field error", err)
 	}
 }

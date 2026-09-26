@@ -19,14 +19,14 @@ import (
 
 // PXEConfig enables the isolated, IPv4-only fallback for UEFI PXE machines.
 // DHCP and TFTP deliver a small iPXE loader; HTTP serves its script and proxies
-// the personalized EFI from the existing boot server. Boot tokens stay server-side.
+// the personalized EFI from the existing boot server using each node's token.
 type PXEConfig struct {
 	HTTPListenAddress string            `json:"-"`
 	BootServerURL     string            `json:"-"`
 	BootCAFile        string            `json:"boot_ca_file,omitempty"`
 	DHCP              DHCPConfig        `json:"dhcp"`
 	TFTP              TFTPConfig        `json:"tftp"`
-	BootTokens        map[string]string `json:"boot_tokens"`
+	NodeTokens        map[string]string `json:"-"`
 }
 
 // Validate keeps the fallback bound to one explicit provisioning IPv4 address.
@@ -84,24 +84,23 @@ func (p PXEConfig) Validate(nodes []NodeCredential) error {
 	} else if p.BootCAFile != "" {
 		return errors.New("pxe.boot_ca_file is only used with HTTPS")
 	}
-	ids := make(map[string]bool, len(nodes))
+	tokens := make(map[string]string, len(nodes))
 	for _, node := range nodes {
-		ids[node.ID] = true
+		tokens[node.ID] = node.Token
 	}
-	if len(p.DHCP.Leases) == 0 || len(p.BootTokens) != len(p.DHCP.Leases) {
-		return errors.New("PXE requires one boot token for each static DHCP lease")
+	if len(p.DHCP.Leases) == 0 || len(p.NodeTokens) != len(p.DHCP.Leases) {
+		return errors.New("PXE requires one node token for each static DHCP lease")
 	}
 	for _, lease := range p.DHCP.Leases {
-		if !ids[lease.NodeID] {
+		token, found := tokens[lease.NodeID]
+		if !found {
 			return fmt.Errorf("PXE lease references unknown controller node %q", lease.NodeID)
 		}
-		if !validBearerToken(p.BootTokens[lease.NodeID]) {
-			return fmt.Errorf("PXE node %q needs a 32-512 character boot token", lease.NodeID)
+		if !validBearerToken(p.NodeTokens[lease.NodeID]) {
+			return fmt.Errorf("PXE node %q needs a 32-512 character node token", lease.NodeID)
 		}
-		for _, node := range nodes {
-			if node.ID == lease.NodeID && node.Token == p.BootTokens[lease.NodeID] {
-				return fmt.Errorf("PXE node %q must use a distinct boot token", lease.NodeID)
-			}
+		if p.NodeTokens[lease.NodeID] != token {
+			return fmt.Errorf("PXE node %q must use its controller node token", lease.NodeID)
 		}
 	}
 	return nil
@@ -162,13 +161,13 @@ func NewPXEHandler(config PXEConfig) (http.Handler, error) {
 	byIP := make(map[netip.Addr]pxeNode, len(config.DHCP.Leases))
 	for _, lease := range config.DHCP.Leases {
 		ip, err := netip.ParseAddr(lease.IP)
-		if err != nil || !ip.Is4() || !validNodeID(lease.NodeID) || config.BootTokens[lease.NodeID] == "" {
-			return nil, errors.New("invalid PXE node lease or boot token")
+		if err != nil || !ip.Is4() || !validNodeID(lease.NodeID) || config.NodeTokens[lease.NodeID] == "" {
+			return nil, errors.New("invalid PXE node lease or node token")
 		}
 		if _, duplicate := byIP[ip]; duplicate {
 			return nil, errors.New("duplicate PXE node IP")
 		}
-		byIP[ip] = pxeNode{id: lease.NodeID, token: config.BootTokens[lease.NodeID]}
+		byIP[ip] = pxeNode{id: lease.NodeID, token: config.NodeTokens[lease.NodeID]}
 	}
 	address, err := netip.ParseAddrPort(config.HTTPListenAddress)
 	if err != nil {
@@ -235,7 +234,7 @@ func (h *pxeHandler) serveEFI(w http.ResponseWriter, r *http.Request) {
 	response, err := h.client.Do(request)
 	if err != nil {
 		// net/http errors often include the requested URL, which contains the
-		// boot token. Never send the error text to logs.
+		// node token. Never send the error text to logs.
 		slog.Warn("PXE boot fetch failed", "node", node.id)
 		http.Error(w, "boot image unavailable", http.StatusBadGateway)
 		return

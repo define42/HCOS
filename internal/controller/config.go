@@ -39,8 +39,9 @@ func (c Config) APIAddress() string {
 	return net.JoinHostPort(c.ServerIP, apiPort)
 }
 
-// RuntimePXE fills in the fixed listener and advertised addresses. DHCP binds
-// the provisioning interface on all IPv4 addresses to receive broadcasts.
+// RuntimePXE derives the listeners, DHCP leases, and boot scripts from the
+// controller and node settings. DHCP binds the provisioning interface on all
+// IPv4 addresses to receive broadcasts.
 func (c Config) RuntimePXE() *PXEConfig {
 	if c.PXE == nil {
 		return nil
@@ -52,17 +53,35 @@ func (c Config) RuntimePXE() *PXEConfig {
 	pxe.DHCP.ServerIP = c.ServerIP
 	pxe.DHCP.NextServerIP = c.ServerIP
 	pxe.TFTP.ListenAddress = net.JoinHostPort(c.ServerIP, pxeTFTPPort)
-	pxe.TFTP.scripts = make(map[string][]byte, len(pxe.DHCP.Leases))
-	for _, lease := range pxe.DHCP.Leases {
-		pxe.TFTP.scripts[lease.IP] = pxeBootScript(c.ServerIP, lease.NodeID, pxe.BootTokens[lease.NodeID])
+	pxe.DHCP.Leases = make([]DHCPLease, 0, len(c.Nodes))
+	pxe.NodeTokens = make(map[string]string, len(c.Nodes))
+	pxe.TFTP.scripts = make(map[string][]byte, len(c.Nodes))
+	for _, node := range c.Nodes {
+		if !node.hasPXE() {
+			continue
+		}
+		pxe.DHCP.Leases = append(pxe.DHCP.Leases, DHCPLease{
+			NodeID: node.ID,
+			MAC:    node.MAC,
+			IP:     node.IP,
+		})
+		pxe.NodeTokens[node.ID] = node.Token
+		pxe.TFTP.scripts[node.IP] = pxeBootScript(c.ServerIP, node.ID, node.Token)
 	}
 	return &pxe
 }
 
-// NodeCredential binds one agent bearer token to one node ID.
+// NodeCredential holds the shared boot and agent token plus optional PXE data.
+// MAC and IP must be supplied together for a node that uses PXE.
 type NodeCredential struct {
 	ID    string `json:"id"`
 	Token string `json:"token"`
+	MAC   string `json:"mac,omitempty"`
+	IP    string `json:"ip,omitempty"`
+}
+
+func (n NodeCredential) hasPXE() bool {
+	return n.MAC != "" || n.IP != ""
 }
 
 // LoadConfig reads a bounded, strict JSON configuration file.
@@ -152,6 +171,17 @@ func (c Config) Validate() error {
 			return errors.New("node tokens must be unique")
 		}
 		tokens[hash] = struct{}{}
+	}
+	for _, node := range c.Nodes {
+		if !node.hasPXE() {
+			continue
+		}
+		if node.MAC == "" || node.IP == "" {
+			return fmt.Errorf("node %q mac and ip must both be set for PXE", node.ID)
+		}
+		if c.PXE == nil {
+			return fmt.Errorf("node %q PXE settings require pxe configuration", node.ID)
+		}
 	}
 	if pxe := c.RuntimePXE(); pxe != nil {
 		if err := pxe.Validate(c.Nodes); err != nil {

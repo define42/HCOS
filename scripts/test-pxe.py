@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise DHCP/TFTP scripts and direct HTTP/HTTPS EFI delivery on loopback."""
+"""Exercise node mapping, then boot-server HTTP/HTTPS listeners on loopback."""
 
 from contextlib import ExitStack
 import hashlib
@@ -29,14 +29,14 @@ class TFTPError(Exception):
         super().__init__(f"TFTP returned error code {code}")
 
 
-def request(port, path, source="127.0.0.2", method="GET", tls=None):
+def request(port, path, source="127.0.0.2", method="GET", tls=None, headers=None):
     client_type = http.client.HTTPSConnection if tls else http.client.HTTPConnection
     options = {"timeout": 10, "source_address": (source, 0)}
     if tls:
         options["context"] = tls
     connection = client_type(SERVER_IP, port, **options)
     try:
-        connection.request(method, path)
+        connection.request(method, path, headers=headers or {})
         response = connection.getresponse()
         return response.status, dict(response.getheaders()), response.read()
     finally:
@@ -78,6 +78,11 @@ def tftp_file(filename, source="127.0.0.2"):
 def write_json(path, value):
     path.write_text(json.dumps(value), encoding="utf-8")
     path.chmod(0o600)
+
+
+def encoded_token(token):
+    return (json.dumps(token, ensure_ascii=False)
+            .replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e").encode())
 
 
 def base_efi():
@@ -159,8 +164,7 @@ def wait_ready(process, port, tls=None):
 def main():
     if not all(path.is_file() for path in (CONTROLLER, BOOTSERVER, LOADER)):
         raise SystemExit("Run 'make ipxe components' first")
-    boot_tokens = [secrets.token_hex(24) + "&+?#%=$" * 66 + "{}", secrets.token_hex(32)]
-    node_tokens = [secrets.token_hex(32), secrets.token_hex(32)]
+    node_tokens = [secrets.token_hex(24) + "&+?#%=$" * 66 + "{}", secrets.token_hex(32)]
     node_ids = ["compute-01", "compute-02"]
 
     with tempfile.TemporaryDirectory(prefix="hcos-pxe-") as temporary, ExitStack() as stack:
@@ -176,7 +180,7 @@ def main():
         nodes = []
         for index, node_id in enumerate(node_ids):
             nodes.append({
-                "id": node_id, "boot_token": boot_tokens[index],
+                "id": node_id,
                 "hcos_version": "1.0.0", "agent_version": "1.0.0", "ca_version": "site-v1",
                 "config": {
                     "api_version": "hcos/v1", "node_id": node_id, "hostname": node_id,
@@ -187,26 +191,24 @@ def main():
                 },
             })
         write_json(work / "nodes.json", {"nodes": nodes})
-        write_json(work / "server.json", {
-            "listen": "127.0.0.1:8443", "pxe_http": True,
+        server_config = {
+            "listen": "127.0.0.1:8443", "pxe_http": False,
             "tls_cert": str(server_cert), "tls_key": str(server_key),
             "images_dir": str(work / "images"), "agents_dir": str(work / "agents"),
             "trust_dir": str(work / "trust"), "cache_dir": str(work / "cache"),
             "nodes_file": str(work / "nodes.json"),
-        })
+        }
+        write_json(work / "server.json", server_config)
         write_json(work / "controller.json", {
             "server_ip": SERVER_IP, "state_dir": str(work / "state"),
             "admin_token": secrets.token_hex(32),
-            "nodes": [{"id": node_id, "token": node_tokens[index]}
-                      for index, node_id in enumerate(node_ids)],
+            "nodes": [{
+                "id": node_id, "token": node_tokens[index],
+                "mac": f"52:54:00:12:34:{index + 56:02d}", "ip": f"127.0.0.{index + 2}",
+            } for index, node_id in enumerate(node_ids)],
             "pxe": {
-                "boot_tokens": dict(zip(node_ids, boot_tokens)),
-                "dhcp": {
-                    "interface": "lo", "subnet_mask": "255.0.0.0",
-                    "leases": [{"node_id": node_id, "mac": f"52:54:00:12:34:{index + 56:02d}",
-                                "ip": f"127.0.0.{index + 2}"}
-                               for index, node_id in enumerate(node_ids)],
-                },
+                "boot_ca_file": str(ca_cert),
+                "dhcp": {"interface": "lo", "subnet_mask": "255.0.0.0"},
             },
         })
         processes = []
@@ -221,8 +223,19 @@ def main():
         bootserver, controller = processes
         tls = ssl.create_default_context(cafile=str(ca_cert))
         wait_ready(bootserver, 8443, tls=tls)
-        wait_ready(bootserver, 80)
         wait_ready(controller, 9443)
+        for _ in range(100):
+            if controller.poll() is not None:
+                raise AssertionError("controller exited before PXE readiness")
+            try:
+                status, _, _ = request(80, "/boot/boot.ipxe")
+                if status == 200:
+                    break
+            except (ConnectionError, OSError):
+                pass
+            time.sleep(0.1)
+        else:
+            raise AssertionError("controller PXE HTTP did not become ready")
 
         loader = tftp_file("bootx64.efi")
         if not loader.startswith(b"MZ") or hashlib.sha256(loader).digest() != hashlib.sha256(LOADER.read_bytes()).digest():
@@ -236,9 +249,18 @@ def main():
             url = urlsplit(lines[1][6:])
             query = parse_qs(url.query, strict_parsing=True)
             if (url.scheme != "http" or url.netloc != SERVER_IP or url.path != "/boot/hcos.efi"
-                    or query != {"node": [node_id], "token": [boot_tokens[index]]}):
+                    or query != {"node": [node_id], "token": [node_tokens[index]]}):
                 raise AssertionError("iPXE script did not select the matching node and token")
             paths.append(url.path + "?" + url.query)
+            # Use the exact credential from the boot script for agent API access.
+            credential = query["token"][0]
+            for target, expected_status in ((node_id, 200), (node_ids[1 - index], 401)):
+                status, _, _ = request(
+                    9443, f"/v1/nodes/{target}/desired",
+                    headers={"Authorization": "Bearer " + credential},
+                )
+                if status != expected_status:
+                    raise AssertionError("script credential did not preserve controller node isolation")
         try:
             tftp_file("boot.ipxe", source="127.0.0.4")
         except TFTPError as error:
@@ -247,16 +269,37 @@ def main():
         else:
             raise AssertionError("unknown source IP received a personalized script")
 
-        # Prove the EFI comes directly from hcos-server after the script is fetched.
+        proxy_images = []
+        for index in range(len(node_ids)):
+            status, _, image = request(80, "/boot/hcos.efi", source=f"127.0.0.{index + 2}")
+            if (status != 200 or encoded_token(node_tokens[index]) not in image
+                    or encoded_token(node_tokens[1 - index]) in image):
+                raise AssertionError("controller proxy did not use the matching consolidated node")
+            proxy_images.append(image)
+        status, _, _ = request(80, "/boot/hcos.efi", source="127.0.0.4")
+        if status != 403:
+            raise AssertionError("controller proxy accepted an unknown source IP")
+
+        # The controller still owns port 80. Exercise the boot server's optional
+        # HTTP listener separately until the production listener handoff is complete.
         stop_process(controller)
+        stop_process(bootserver)
+        server_config["pxe_http"] = True
+        write_json(work / "server.json", server_config)
+        output = stack.enter_context((work / "server.log").open("ab"))
+        bootserver = subprocess.Popen([str(BOOTSERVER), "-config", str(work / "server.json")],
+                                      stdout=output, stderr=subprocess.STDOUT, cwd=work)
+        stack.callback(stop_process, bootserver)
+        wait_ready(bootserver, 8443, tls=tls)
+        wait_ready(bootserver, 80)
         images = []
         for index, path in enumerate(paths):
             source = f"127.0.0.{index + 2}"
             status, headers, image = request(80, path, source=source)
             if (status != 200 or not image.startswith(b"MZ")
                     or len(image) != int(headers.get("Content-Length", "0"))
-                    or node_tokens[index].encode() not in image
-                    or node_tokens[1 - index].encode() in image
+                    or encoded_token(node_tokens[index]) not in image
+                    or encoded_token(node_tokens[1 - index]) in image
                     or b"usr/local/bin/hcos-agent" not in image):
                 raise AssertionError("HTTP did not deliver the correct personalized EFI")
             status, headers, body = request(80, path, source=source, method="HEAD")
@@ -265,21 +308,24 @@ def main():
             status, _, secure_image = request(8443, path, source=source, tls=tls)
             if status != 200 or secure_image != image:
                 raise AssertionError("HTTP and HTTPS did not serve the same personalized EFI")
+            if image != proxy_images[index]:
+                raise AssertionError("controller proxy and direct boot server selected different node images")
             images.append(image)
         if images[0] == images[1] or len(list((work / "cache").glob("*.efi"))) != 2:
             raise AssertionError("node cache entries were not distinct and shared between listeners")
         for port, context in ((80, None), (8443, tls)):
             for path in ("/boot/hcos.efi", "/boot/hcos.efi?node=compute-01&token=wrong",
-                         "/boot/hcos.efi?node=compute-02&token=" + quote(boot_tokens[0], safe="")):
+                         "/boot/hcos.efi?node=compute-02&token=" + quote(node_tokens[0], safe="")):
                 status, _, _ = request(port, path, tls=context)
                 if status != 403:
                     raise AssertionError(f"port {port} accepted a missing or incorrect node token")
         stop_process(bootserver)
         for log_name in ("server.log", "controller.log"):
             log = (work / log_name).read_text(encoding="utf-8")
-            if any(token in log or quote(token, safe="") in log for token in boot_tokens + node_tokens):
-                raise AssertionError("a service logged a boot or agent token")
-    print("PASS: per-node TFTP scripts; direct authenticated HTTP/HTTPS EFIs; shared cache; clean shutdown")
+            if any(token in log or quote(token, safe="") in log
+                   or encoded_token(token).decode() in log for token in node_tokens):
+                raise AssertionError("a service logged a node token")
+    print("PASS: shared node tokens authorize controller API and personalized EFIs; separate HTTP/HTTPS boot-server phase")
 
 
 if __name__ == "__main__":

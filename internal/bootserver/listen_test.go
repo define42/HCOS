@@ -70,7 +70,7 @@ func TestRunSharesBootImagesOnHTTPAndHTTPS(t *testing.T) {
 	for _, origin := range []string{"https://127.0.0.1:8443", "http://127.0.0.1"} {
 		for _, path := range []string{
 			"/boot/hcos.efi", "/boot/hcos.efi?node=node-01&token=wrong",
-			"/boot/hcos.efi?node=node-01&token=" + node.BootToken + "&token=duplicate",
+			"/boot/hcos.efi?node=node-01&token=" + node.Config.ControllerToken + "&token=duplicate",
 		} {
 			response, err := client.Get(origin + path)
 			if err != nil {
@@ -117,7 +117,7 @@ func TestRunSharesBootImagesOnHTTPAndHTTPS(t *testing.T) {
 			t.Fatal("listener remained open after cancellation")
 		}
 	}
-	if strings.Contains(logs.String(), node.BootToken) || strings.Contains(logs.String(), node.Config.ControllerToken) {
+	if strings.Contains(logs.String(), node.Config.ControllerToken) {
 		t.Fatal("boot credentials leaked to logs")
 	}
 }

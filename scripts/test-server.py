@@ -64,9 +64,9 @@ def fetch_image(url, token, image):
         urllib.request.urlopen(url + "/boot/hcos.efi?node=smoke&token=wrong", timeout=10)
     except urllib.error.HTTPError as error:
         if error.code not in (401, 403):
-            raise RuntimeError(f"invalid boot token returned HTTP {error.code}") from error
+            raise RuntimeError(f"invalid node token returned HTTP {error.code}") from error
     else:
-        raise RuntimeError("invalid boot token was accepted")
+        raise RuntimeError("invalid node token was accepted")
 
     request = urllib.request.Request(endpoint, method="HEAD")
     with urllib.request.urlopen(request, timeout=60) as response:
@@ -121,11 +121,11 @@ while :; do sleep 3600; done
         token = secrets.token_hex(32)
         nodes = directory / "nodes.json"
         write_json(nodes, {"nodes": [{
-            "id": "smoke", "boot_token": token,
+            "id": "smoke",
             "hcos_version": "1.0.0", "agent_version": "1.0.0", "ca_version": "site-v1",
             "config": {
                 "api_version": "hcos/v1", "node_id": "smoke", "hostname": "smoke",
-                "controller": "https://controller.internal", "controller_token": "smoke-token",
+                "controller": "https://controller.internal", "controller_token": token,
                 "storage": {"path": "/vm-storage"},
                 "network": {"management_interface": "eth0", "vm_bridge": "br-vm"},
             },
