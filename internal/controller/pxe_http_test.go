@@ -25,7 +25,7 @@ func testPXEConfig(t *testing.T, bootURL string) PXEConfig {
 			}},
 		},
 		TFTP: TFTPConfig{
-			ListenAddress: "127.0.0.1:1069", LoaderPath: filepath.Join(t.TempDir(), "bootx64.efi"),
+			ListenAddress: "127.0.0.1:1069",
 		},
 		BootTokens: map[string]string{"compute-01": testPXEBootToken},
 	}

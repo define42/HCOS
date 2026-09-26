@@ -14,38 +14,48 @@ import (
 )
 
 func TestTFTPConfigAndAssetValidation(t *testing.T) {
-	folder := t.TempDir()
-	loader := filepath.Join(folder, "loader.efi")
-	if err := os.WriteFile(loader, []byte("PE-loader"), 0o600); err != nil {
-		t.Fatal(err)
+	config := TFTPConfig{ListenAddress: "127.0.0.1:1069"}
+	server, err := NewTFTPServer(config)
+	if err != nil {
+		t.Fatalf("embedded loader: %v", err)
 	}
-	config := TFTPConfig{ListenAddress: "127.0.0.1:1069", LoaderPath: loader}
-	if _, err := NewTFTPServer(config); err != nil {
-		t.Fatalf("valid loader: %v", err)
+	if !bytes.HasPrefix(server.loader, []byte("MZ")) {
+		t.Fatal("embedded iPXE loader is not a PE image")
 	}
 	bad := config
-	bad.LoaderPath = "relative.efi"
-	if _, err := NewTFTPServer(bad); err == nil {
-		t.Fatal("relative loader path accepted")
-	}
-	bad = config
 	bad.ListenAddress = "127.0.0.1:0"
 	if _, err := NewTFTPServer(bad); err == nil {
 		t.Fatal("zero listen port accepted")
 	}
-	symlink := filepath.Join(folder, "linked.efi")
-	if err := os.Symlink(loader, symlink); err != nil {
+	bad = config
+	bad.ScriptPath = "relative.ipxe"
+	if _, err := NewTFTPServer(bad); err == nil {
+		t.Fatal("relative script path accepted")
+	}
+	folder := t.TempDir()
+	script := filepath.Join(folder, "boot.ipxe")
+	if err := os.WriteFile(script, []byte("#!ipxe\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	bad = config
-	bad.LoaderPath = symlink
-	if _, err := NewTFTPServer(bad); err == nil {
-		t.Fatal("symlinked loader accepted")
+	bad.ScriptPath = script
+	if _, err := NewTFTPServer(bad); err != nil {
+		t.Fatalf("valid script: %v", err)
 	}
-	bad = config
-	bad.ScriptPath = loader
+	symlink := filepath.Join(folder, "linked.ipxe")
+	if err := os.Symlink(script, symlink); err != nil {
+		t.Fatal(err)
+	}
+	bad.ScriptPath = symlink
 	if _, err := NewTFTPServer(bad); err == nil {
-		t.Fatal("loader reused as script accepted")
+		t.Fatal("symlinked script accepted")
+	}
+}
+
+func TestTFTPServesEmbeddedIPXE(t *testing.T) {
+	address := startTFTPTestServer(t, nil, nil)
+	got := fetchTFTP(t, address, "bootx64.efi", 1024, false)
+	if !bytes.Equal(got, embeddedIPXELoader) {
+		t.Fatalf("embedded loader differs: got %d bytes, want %d", len(got), len(embeddedIPXELoader))
 	}
 }
 
@@ -156,16 +166,12 @@ func TestTFTPBlockNumberWrap(t *testing.T) {
 func startTFTPTestServer(t *testing.T, loader, script []byte) *net.UDPAddr {
 	t.Helper()
 	folder := t.TempDir()
-	loaderPath := filepath.Join(folder, "loader.efi")
-	if err := os.WriteFile(loaderPath, loader, 0o600); err != nil {
-		t.Fatal(err)
-	}
 	listener, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	address := listener.LocalAddr().(*net.UDPAddr)
-	config := TFTPConfig{ListenAddress: net.JoinHostPort("127.0.0.1", strconv.Itoa(address.Port)), LoaderPath: loaderPath}
+	config := TFTPConfig{ListenAddress: net.JoinHostPort("127.0.0.1", strconv.Itoa(address.Port))}
 	if script != nil {
 		config.ScriptPath = filepath.Join(folder, "boot.ipxe")
 		if err := os.WriteFile(config.ScriptPath, script, 0o600); err != nil {
@@ -175,6 +181,9 @@ func startTFTPTestServer(t *testing.T, loader, script []byte) *net.UDPAddr {
 	server, err := NewTFTPServer(config)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if loader != nil {
+		server.loader = loader
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

@@ -37,15 +37,14 @@ const (
 	tftpOACK  = 6
 )
 
-// TFTPConfig identifies the two public boot assets. TFTP never serves a path
-// supplied by a client and never carries node credentials or personalized EFI.
+// TFTPConfig identifies the listener and optional public boot script. TFTP
+// never serves a path supplied by a client or carries personalized EFI.
 type TFTPConfig struct {
 	ListenAddress string `json:"listen_address"`
-	LoaderPath    string `json:"loader_path"`
 	ScriptPath    string `json:"script_path,omitempty"`
 }
 
-// Validate rejects invalid listener and asset paths before the UDP port opens.
+// Validate rejects invalid listener and script paths before the UDP port opens.
 func (c TFTPConfig) Validate() error {
 	_, port, err := net.SplitHostPort(c.ListenAddress)
 	if err != nil {
@@ -55,14 +54,8 @@ func (c TFTPConfig) Validate() error {
 	if err != nil || portNumber < 1 || portNumber > 65535 {
 		return errors.New("TFTP listen_address must use a UDP port from 1 to 65535")
 	}
-	if !cleanAbsolutePath(c.LoaderPath) {
-		return errors.New("TFTP loader_path must be a clean absolute file path")
-	}
 	if c.ScriptPath != "" && !cleanAbsolutePath(c.ScriptPath) {
 		return errors.New("TFTP script_path must be a clean absolute file path")
-	}
-	if c.ScriptPath != "" && c.ScriptPath == c.LoaderPath {
-		return errors.New("TFTP loader_path and script_path must differ")
 	}
 	return nil
 }
@@ -75,23 +68,25 @@ func cleanAbsolutePath(path string) bool {
 // Serve owns each transfer socket; the caller owns the initial UDP listener.
 type TFTPServer struct {
 	config   TFTPConfig
+	loader   []byte
 	sessions chan struct{}
 }
 
-// NewTFTPServer verifies the configured assets and constructs a bounded server.
+// NewTFTPServer verifies the embedded loader and optional script, then
+// constructs a bounded server.
 func NewTFTPServer(config TFTPConfig) (*TFTPServer, error) {
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
-	if err := checkTFTPAsset(config.LoaderPath, tftpMaxLoaderBytes); err != nil {
-		return nil, fmt.Errorf("TFTP loader: %w", err)
+	if len(embeddedIPXELoader) == 0 || len(embeddedIPXELoader) > tftpMaxLoaderBytes {
+		return nil, errors.New("TFTP embedded loader size is invalid")
 	}
 	if config.ScriptPath != "" {
 		if err := checkTFTPAsset(config.ScriptPath, tftpMaxScriptBytes); err != nil {
 			return nil, fmt.Errorf("TFTP script: %w", err)
 		}
 	}
-	return &TFTPServer{config: config, sessions: make(chan struct{}, tftpMaxSessions)}, nil
+	return &TFTPServer{config: config, loader: embeddedIPXELoader, sessions: make(chan struct{}, tftpMaxSessions)}, nil
 }
 
 // Serve accepts only read requests for bootx64.efi and, when configured,
@@ -127,8 +122,7 @@ func (s *TFTPServer) Serve(ctx context.Context, conn *net.UDPConn) error {
 			writeTFTPError(conn, peer, code, message)
 			continue
 		}
-		path, limit := s.assetForName(request.filename)
-		if path == "" {
+		if request.filename != "bootx64.efi" && (request.filename != "boot.ipxe" || s.config.ScriptPath == "") {
 			writeTFTPError(conn, peer, 1, "file not found")
 			continue
 		}
@@ -138,15 +132,27 @@ func (s *TFTPServer) Serve(ctx context.Context, conn *net.UDPConn) error {
 			writeTFTPError(conn, peer, 0, "server busy")
 			continue
 		}
-		file, size, err := openTFTPAsset(path, limit)
-		if err != nil {
-			<-s.sessions
-			writeTFTPError(conn, peer, 1, "file unavailable")
-			continue
+		var asset io.ReaderAt
+		var size int64
+		var file *os.File
+		if request.filename == "bootx64.efi" {
+			asset = bytes.NewReader(s.loader)
+			size = int64(len(s.loader))
+		} else {
+			var err error
+			file, size, err = openTFTPAsset(s.config.ScriptPath, tftpMaxScriptBytes)
+			if err != nil {
+				<-s.sessions
+				writeTFTPError(conn, peer, 1, "file unavailable")
+				continue
+			}
+			asset = file
 		}
 		transferConn, err := newTFTPTransferSocket(conn, peer)
 		if err != nil {
-			_ = file.Close()
+			if file != nil {
+				_ = file.Close()
+			}
 			<-s.sessions
 			writeTFTPError(conn, peer, 0, "server busy")
 			continue
@@ -155,23 +161,13 @@ func (s *TFTPServer) Serve(ctx context.Context, conn *net.UDPConn) error {
 		go func() {
 			defer transfers.Done()
 			defer func() { <-s.sessions }()
-			defer file.Close()
+			if file != nil {
+				defer file.Close()
+			}
 			defer transferConn.Close()
-			s.transfer(ctx, transferConn, peer, file, size, request.options)
+			s.transfer(ctx, transferConn, peer, asset, size, request.options)
 		}()
 	}
-}
-
-func (s *TFTPServer) assetForName(name string) (string, int64) {
-	switch name {
-	case "bootx64.efi":
-		return s.config.LoaderPath, tftpMaxLoaderBytes
-	case "boot.ipxe":
-		if s.config.ScriptPath != "" {
-			return s.config.ScriptPath, tftpMaxScriptBytes
-		}
-	}
-	return "", 0
 }
 
 func checkTFTPAsset(path string, maximum int64) error {
@@ -257,7 +253,7 @@ func newTFTPTransferSocket(listener *net.UDPConn, peer *net.UDPAddr) (*net.UDPCo
 	return net.ListenUDP(network, &net.UDPAddr{IP: ip, Zone: local.Zone})
 }
 
-func (s *TFTPServer) transfer(ctx context.Context, conn *net.UDPConn, peer *net.UDPAddr, file *os.File, size int64, options map[string]string) {
+func (s *TFTPServer) transfer(ctx context.Context, conn *net.UDPConn, peer *net.UDPAddr, asset io.ReaderAt, size int64, options map[string]string) {
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 	deadline := time.Now().Add(tftpSessionLimit)
@@ -296,7 +292,7 @@ func (s *TFTPServer) transfer(ctx context.Context, conn *net.UDPConn, peer *net.
 		binary.BigEndian.PutUint16(data[:2], tftpDATA)
 		binary.BigEndian.PutUint16(data[2:4], uint16(sequence)) // RFC 1350's 16-bit block number wraps.
 		if count > 0 {
-			n, err := file.ReadAt(data[4:], offset)
+			n, err := asset.ReadAt(data[4:], offset)
 			if n != count || (err != nil && err != io.EOF) {
 				writeTFTPError(conn, peer, 0, "asset read failed")
 				return

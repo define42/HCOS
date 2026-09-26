@@ -71,7 +71,7 @@ def tftp_loader(port_number):
 
 def main():
     if not CONTROLLER.is_file() or not LOADER.is_file():
-        raise SystemExit("Run 'make components' and 'make ipxe' first")
+        raise SystemExit("Run 'make ipxe components' first")
     admin_port = port(socket.SOCK_STREAM)
     http_port = port(socket.SOCK_STREAM)
     dhcp_port = port(socket.SOCK_DGRAM)
@@ -126,7 +126,7 @@ def main():
                         "subnet_mask": "255.0.0.0",
                         "leases": [{"node_id": "compute-01", "mac": "52:54:00:12:34:56", "ip": "127.0.0.2"}],
                     },
-                    "tftp": {"listen_address": f"127.0.0.1:{tftp_port}", "loader_path": str(LOADER)},
+                    "tftp": {"listen_address": f"127.0.0.1:{tftp_port}"},
                 },
             }
             config_path = work / "controller.json"
@@ -134,7 +134,7 @@ def main():
             config_path.chmod(0o600)
             with (work / "controller.log").open("wb") as output:
                 process = subprocess.Popen([str(CONTROLLER), "-config", str(config_path)],
-                                           stdout=output, stderr=subprocess.STDOUT)
+                                           stdout=output, stderr=subprocess.STDOUT, cwd=work)
                 try:
                     for _ in range(100):
                         if process.poll() is not None:

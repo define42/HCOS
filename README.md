@@ -6,18 +6,18 @@ The runtime includes KVM modules for Intel and AMD CPUs, the x86_64 QEMU system 
 
 ## Build and test
 
-Use an x86_64 Linux host with Docker, Git, Make, Go 1.27 or newer, shellcheck, and Python 3. The build uses a digest-pinned Alpine 3.24.1 container and needs no privileged container. Packages are resolved from Alpine's 3.24 repositories when you build, so their versions can change within that branch.
+Use an x86_64 Linux host with Docker, Git, Make, Go 1.27 or newer, shellcheck, and Python 3. Building iPXE also needs GCC, binutils, Perl, xz, mtools, liblzma development headers, and tar. The build uses a digest-pinned Alpine 3.24.1 container and needs no privileged container. Packages are resolved from Alpine's 3.24 repositories when you build, so their versions can change within that branch.
 
 ```sh
+make ipxe                 # Build the x64 UEFI PXE loader and refresh the embedded controller asset.
 make check                # Check scripts; run Go tests with the race detector and go vet.
 make build                # Write dist/hcos-base.efi.
-make components           # Build static linux/amd64 hcos-server, hcos-controller, hcos-agent.
+make components           # Build static linux/amd64 components; the controller embeds iPXE.
 make verify               # Check EFI sections, rootfs, modules, and tools.
 make smoke                # Boot the generic base EFI in OVMF/QEMU.
 make smoke-injected       # Boot an EFI with a sample agent and CA.
 make smoke-server         # Build an EFI through the Go boot server and boot it.
 make smoke-control-plane  # Exercise the real controller and agent with a fake virsh.
-make ipxe                 # Build the x64 UEFI PXE loader and its source archive.
 make smoke-pxe            # Exercise controller PXE HTTP and TFTP on loopback.
 ```
 
@@ -37,7 +37,7 @@ Anyone with the EFI file can attempt to guess its embedded password hash offline
 
 ## Container release
 
-The Linux/amd64 container carries the tested artifacts from the same commit. Its default process is `hcos-controller`; run `hcos-server` from a second container using the same image. The agent binary is packaged as a boot-server asset for injection into HCOS nodes. The image contains no node credentials, site CA, signing keys, or mutable controller state.
+The Linux/amd64 container carries the tested artifacts from the same commit. Its default process is `hcos-controller`; run `hcos-server` from a second container using the same image. The agent binary is packaged as a boot-server asset for injection into HCOS nodes. The iPXE loader is embedded in the controller binary. The default image contains no node credentials, site CA, signing keys, or mutable controller state.
 
 [GitHub Container Registry](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry) initially makes a new package private; set the package visibility to public in GitHub if anonymous pulls are required.
 
@@ -47,7 +47,6 @@ The Linux/amd64 container carries the tested artifacts from the same commit. Its
 | `/usr/local/bin/hcos-server` | Boot server and EFI personalization |
 | `/var/lib/hcos/images/hcos-sha-<commit SHA>.efi` | Generic base EFI |
 | `/var/lib/hcos/agents/sha-<commit SHA>/hcos-agent` | Agent for EFI injection |
-| `/srv/hcos-pxe/bootx64.efi` | x64 UEFI iPXE loader |
 | `/usr/share/source/ipxe-source.tar.gz` | Corresponding iPXE source archive |
 
 Set both `hcos_version` and `agent_version` in each boot-server node record to `sha-<commit SHA>`. Keep `images_dir` and `agents_dir` at `/var/lib/hcos/images` and `/var/lib/hcos/agents`. Mount the site trust directory and private writable cache separately so the packaged EFI and agent remain visible. Supply the server config, node records, TLS materials, and optional Secure Boot signing keys at their configured absolute paths.
@@ -79,7 +78,7 @@ The controller uses host networking for PXE so it can bind the provisioning inte
 To check a local image built from the current checkout, build the six release artifacts first, then compare every packaged file byte for byte against `dist/`:
 
 ```sh
-make build components ipxe
+make build ipxe components
 commit=$(git rev-parse HEAD)
 docker build --platform linux/amd64 --file Dockerfile.release \
   --build-arg "HCOS_COMMIT_SHA=$commit" --tag hcos:local .
@@ -203,16 +202,16 @@ UEFI PXE -> DHCP -> TFTP bootx64.efi (iPXE) -> HTTP /boot/boot.ipxe
 
 Only the small iPXE loader travels over TFTP. The controller serves the boot script and streams the personalized EFI over HTTP; it obtains the EFI from the existing boot server over verified HTTPS. Neither the boot token nor the boot server URL is sent in the iPXE script. The controller maps the HTTP client's source IP against its configured static IP-to-node table, then sends that node's boot token to the boot server; it does not verify that the client previously completed a DHCP lease exchange. The EFI still contains that node's controller credential, and PXE, TFTP, DHCP, and the controller's provisioning HTTP endpoint do not authenticate the machine. A client able to spoof a configured MAC or IP, or observe provisioning HTTP traffic, can obtain a node image. Use this fallback only on a physically or otherwise isolated lab network.
 
-Build the unsigned x64 UEFI iPXE loader and install it where the controller can read it:
+Build the unsigned x64 UEFI iPXE loader before compiling the controller. The iPXE build refreshes the loader embedded in the Go package:
 
 ```sh
-scripts/build-ipxe.sh
-sudo install -D -m 0644 dist/bootx64.efi /srv/hcos-pxe/bootx64.efi
+make ipxe
+make components
 ```
 
-The build downloads a pinned iPXE source revision, embeds `dhcp` followed by `chain http://${next-server}/boot/boot.ipxe`, and writes its corresponding source archive to `dist/ipxe-source.tar.gz` plus provenance and license metadata under `dist/ipxe/`. Run `make smoke-pxe` after `make components` and `make ipxe` to check the controller listeners with the built loader on loopback. To rebuild from a local source checkout without network access, set `IPXE_SOURCE=/path/to/ipxe` to a checkout containing the pinned commit. The ordinary HCOS PXE path uses HTTP only between iPXE and the controller; the controller verifies the boot server's HTTPS certificate using `boot_ca_file`.
+The build downloads a pinned iPXE source revision, embeds `dhcp` followed by `chain http://${next-server}/boot/boot.ipxe`, and writes its corresponding source archive to `dist/ipxe-source.tar.gz` plus provenance and license metadata under `dist/ipxe/`. Run `make smoke-pxe` after `make ipxe` and `make components` to check the controller listeners with the built loader on loopback. To rebuild from a local source checkout without network access, set `IPXE_SOURCE=/path/to/ipxe` to a checkout containing the pinned commit. The ordinary HCOS PXE path uses HTTP only between iPXE and the controller; the controller verifies the boot server's HTTPS certificate using `boot_ca_file`.
 
-Add `pxe` to the controller JSON. This complete example uses one node and omits `router` and `dns` so the provisioning network has no advertised gateway or resolver. The boot token must be the **same value** as `boot_token` for this node in the boot server's `nodes.json`, and must differ from its controller agent token. Generate each token separately with `openssl rand -hex 32` and store this file with mode `0600`.
+Remove `tftp.loader_path` from existing controller configs; the loader is now part of `hcos-controller` and that old key is rejected. Add `pxe` to the controller JSON. This complete example uses one node and omits `router` and `dns` so the provisioning network has no advertised gateway or resolver. The boot token must be the **same value** as `boot_token` for this node in the boot server's `nodes.json`, and must differ from its controller agent token. Generate each token separately with `openssl rand -hex 32` and store this file with mode `0600`.
 
 ```json
 {
@@ -244,16 +243,15 @@ Add `pxe` to the controller JSON. This complete example uses one node and omits 
       }]
     },
     "tftp": {
-      "listen_address": "192.168.50.2:69",
-      "loader_path": "/srv/hcos-pxe/bootx64.efi"
+      "listen_address": "192.168.50.2:69"
     }
   }
 }
 ```
 
-The controller's DHCP service is bound to `eno2` and answers only that MAC. It advertises `bootx64.efi` for UEFI architecture codes 7 and 9; iPXE clients receive the controller's HTTP script URL. TFTP permits reads of `bootx64.efi` and, if `tftp.script_path` is configured, a small `boot.ipxe`; it never serves personalized EFIs. The controller's PXE HTTP service listens on the configured server IP, port 80, and serves only `/boot/boot.ipxe` and `/boot/hcos.efi`. Permit UDP 67 and 69, TFTP's ephemeral transfer ports, and TCP 80 on the isolated interface. Binding DHCP and TFTP to privileged ports normally requires root or appropriate capabilities.
+The controller's DHCP service is bound to `eno2` and answers only that MAC. It advertises `bootx64.efi` for UEFI architecture codes 7 and 9; iPXE clients receive the controller's HTTP script URL. TFTP serves the embedded `bootx64.efi` and, if `tftp.script_path` is configured, a small `boot.ipxe`; it never serves personalized EFIs. The controller's PXE HTTP service listens on the configured server IP, port 80, and serves only `/boot/boot.ipxe` and `/boot/hcos.efi`. Permit UDP 67 and 69, TFTP's ephemeral transfer ports, and TCP 80 on the isolated interface. Binding DHCP and TFTP to privileged ports normally requires root or appropriate capabilities.
 
-This loader is unsigned. Firmware Secure Boot will reject it unless you separately sign it with a key trusted by that firmware or use a compatible trusted loader. Signing only the personalized HCOS EFI does not authorize the preceding iPXE loader. The fallback supports x64 UEFI PXE; it does not add legacy BIOS boot support.
+The embedded loader is unsigned. Secure Boot requires embedding a loader signed by a key trusted by the firmware, then rebuilding the controller. Signing only the personalized HCOS EFI does not authorize the preceding iPXE loader. The fallback supports x64 UEFI PXE; it does not add legacy BIOS boot support.
 
 ## Controller API and agent
 

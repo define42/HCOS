@@ -90,6 +90,19 @@ jobs:
         if: ${{ hashFiles('scripts/build-ipxe.sh') != '' }}
         run: sudo apt-get install --no-install-recommends -y build-essential liblzma-dev mtools xz-utils perl
 
+      - name: Build iPXE UEFI loader
+        if: ${{ hashFiles('scripts/build-ipxe.sh') != '' }}
+        run: |
+          make ipxe
+          test -s dist/bootx64.efi
+          test -s dist/ipxe-source.tar.gz
+          if [[ -f internal/controller/bootx64.efi ]]; then
+            cmp dist/bootx64.efi internal/controller/bootx64.efi
+            if git ls-files --error-unmatch internal/controller/bootx64.efi >/dev/null 2>&1; then
+              git diff --exit-code -- internal/controller/bootx64.efi
+            fi
+          fi
+
       - name: Check scripts
         run: make check
 
@@ -99,13 +112,6 @@ jobs:
       - name: Build HCOS Go components
         if: ${{ hashFiles('go.mod') != '' }}
         run: make components
-
-      - name: Build iPXE UEFI loader
-        if: ${{ hashFiles('scripts/build-ipxe.sh') != '' }}
-        run: |
-          make ipxe
-          test -s dist/bootx64.efi
-          test -s dist/ipxe-source.tar.gz
 
       - name: Verify EFI contents
         run: make verify
@@ -189,6 +195,19 @@ jobs:
         if: ${{ hashFiles('scripts/build-ipxe.sh') != '' }}
         run: sudo apt-get install --no-install-recommends -y build-essential liblzma-dev mtools xz-utils perl
 
+      - name: Build iPXE UEFI loader
+        if: ${{ hashFiles('scripts/build-ipxe.sh') != '' }}
+        run: |
+          make ipxe
+          test -s dist/bootx64.efi
+          test -s dist/ipxe-source.tar.gz
+          if [[ -f internal/controller/bootx64.efi ]]; then
+            cmp dist/bootx64.efi internal/controller/bootx64.efi
+            if git ls-files --error-unmatch internal/controller/bootx64.efi >/dev/null 2>&1; then
+              git diff --exit-code -- internal/controller/bootx64.efi
+            fi
+          fi
+
       - name: Check scripts
         run: make check
 
@@ -198,13 +217,6 @@ jobs:
       - name: Build HCOS Go components
         if: ${{ hashFiles('go.mod') != '' }}
         run: make components
-
-      - name: Build iPXE UEFI loader
-        if: ${{ hashFiles('scripts/build-ipxe.sh') != '' }}
-        run: |
-          make ipxe
-          test -s dist/bootx64.efi
-          test -s dist/ipxe-source.tar.gz
 
       - name: Verify EFI contents
         run: make verify

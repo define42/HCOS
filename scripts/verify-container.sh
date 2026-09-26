@@ -50,7 +50,6 @@ verify_file hcos-base.efi "/var/lib/hcos/images/hcos-sha-${commit}.efi"
 verify_file hcos-agent "/var/lib/hcos/agents/sha-${commit}/hcos-agent"
 verify_file hcos-controller /usr/local/bin/hcos-controller
 verify_file hcos-server /usr/local/bin/hcos-server
-verify_file bootx64.efi /srv/hcos-pxe/bootx64.efi
 verify_file ipxe-source.tar.gz /usr/share/source/ipxe-source.tar.gz
 
 echo "Verified container assets for $commit"

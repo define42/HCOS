@@ -23,6 +23,10 @@ smoke-injected:
 
 components:
 	mkdir -p dist
+	@if [ -f dist/bootx64.efi ] && ! cmp -s dist/bootx64.efi internal/controller/bootx64.efi; then \
+		echo 'Embedded iPXE loader differs from dist/bootx64.efi; run make ipxe first.' >&2; \
+		exit 1; \
+	fi
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/hcos-server ./cmd/hcos-server
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/hcos-controller ./cmd/hcos-controller
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/hcos-agent ./cmd/hcos-agent

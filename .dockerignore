@@ -8,5 +8,4 @@
 !dist/hcos-controller
 !dist/hcos-server
 !dist/hcos-agent
-!dist/bootx64.efi
 !dist/ipxe-source.tar.gz
