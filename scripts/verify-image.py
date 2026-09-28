@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Adapted from NetDesk's Apache-2.0 UKI verifier for HCOS.
-"""Verify that an HCOS UKI contains a bootable x86-64 QEMU/libvirt host."""
+"""Verify an HCOS UKI's x86-64 virtualization and unconfigured Ceph runtime."""
 
 import argparse
 from dataclasses import dataclass
@@ -200,6 +200,24 @@ def enabled_service(entries, name):
     executable(entries, target)
 
 
+def verify_ceph(entries):
+    for name in ("usr/bin/ceph-osd", "usr/bin/ceph-mon", "usr/bin/ceph-mgr",
+                 "usr/bin/ceph", "usr/sbin/ceph-volume", "usr/bin/rbd",
+                 "sbin/dmsetup", "bin/findmnt", "etc/init.d/ceph"):
+        executable(entries, name)
+    for name in ("usr/lib/qemu/block-rbd.so",
+                 "usr/lib/libvirt/storage-backend/libvirt_storage_backend_rbd.so",
+                 "etc/conf.d/ceph"):
+        entry = resolve(entries, name)
+        check(stat.S_ISREG(entry.mode) and entry.size,
+              f"missing Ceph runtime asset /{name}")
+    enabled = sorted(name for name in entries
+                     if name.startswith("etc/runlevels/") and
+                     posixpath.basename(name).startswith("ceph"))
+    check(not enabled,
+          "generic base must not enable Ceph services: " + ", ".join(enabled))
+
+
 def verify_console_logins(entries, inittab):
     executable(entries, "sbin/getty")
     consoles = set()
@@ -243,6 +261,7 @@ def verify_rootfs(entries, contents, kernel_version):
         executable(entries, name)
     for name in LIBVIRT_DRIVERS:
         driver(entries, name)
+    verify_ceph(entries)
 
     for name in ("etc/libvirt/libvirtd.conf", "etc/libvirt/qemu.conf",
                  "etc/init.d/libvirtd", "etc/init.d/virtlogd", "etc/init.d/virtlockd"):
@@ -333,7 +352,8 @@ def verify(path):
         with gzip.GzipFile(fileobj=SectionStream(image, sections[".initrd"])) as archive:
             count = verify_rootfs(*read_archive(archive), kernel_version)
     print(f"Verified {path}: {image_size / (1024 * 1024):.1f} MiB EFI, "
-          f"kernel {kernel_version}, {count} rootfs entries; x86-64 KVM/QEMU/libvirt present")
+          f"kernel {kernel_version}, {count} rootfs entries; "
+          "x86-64 KVM/QEMU/libvirt and Ceph runtime present")
 
 
 def main():

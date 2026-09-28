@@ -13,5 +13,17 @@ iproute2
 dnsmasq
 qemu-system-x86_64
 qemu-img
+qemu-block-rbd
 libvirt-qemu
 libvirt-daemon-openrc
+# Ceph storage roles and OpenRC service definitions.
+ceph19-osd
+ceph19-mon
+ceph19-mgr
+ceph19-openrc
+# Device-mapper and full util-linux commands used by ceph-volume.
+device-mapper
+blkid
+findmnt
+lsblk
+wipefs

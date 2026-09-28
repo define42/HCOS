@@ -1,6 +1,6 @@
 #!/sbin/openrc-run
 # shellcheck disable=SC2034
-description="Check the HCOS virtualization runtime"
+description="Check the HCOS virtualization and Ceph runtime"
 
 depend() {
     need libvirtd
@@ -8,9 +8,23 @@ depend() {
 }
 
 start() {
-    ebegin "Checking QEMU and libvirt"
+    ebegin "Checking QEMU, libvirt, and Ceph"
     qemu-system-x86_64 --version >/dev/null 2>&1 || { eend 1; return 1; }
     qemu-img --version >/dev/null 2>&1 || { eend 1; return 1; }
+    qemu-img --help 2>/dev/null | grep -Eq '(^|[[:space:]])rbd([[:space:]]|$)' || {
+        eend 1 "QEMU RBD support is unavailable"
+        return 1
+    }
+    for ceph_tool in ceph-osd ceph-mon ceph-mgr ceph rbd; do
+        "$ceph_tool" --version >/dev/null 2>&1 || {
+            eend 1 "$ceph_tool could not start"
+            return 1
+        }
+    done
+    ceph-volume --help >/dev/null 2>&1 || {
+        eend 1 "ceph-volume could not start"
+        return 1
+    }
     count=0
     until virsh -c qemu:///system list --all >/dev/null 2>&1 &&
           virsh -c qemu:///system net-list --name 2>/dev/null | grep -Fxq default &&

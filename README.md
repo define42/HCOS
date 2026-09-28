@@ -2,7 +2,7 @@
 
 HCOS is a small, diskless x86_64 virtualization host built from Alpine Linux. The build produces one generic Unified Kernel Image (UKI), `dist/hcos-base.efi`. Following the [NetDesk boot design](https://github.com/define42/NetDesk/blob/83c7d1a4ac93ba72ebcac305678917aa524b72df/docs/boot-design.md), it embeds the Linux kernel, command line, and a compressed initramfs containing the complete root filesystem. Firmware loads one EFI file; Linux unpacks the filesystem into RAM and starts OpenRC.
 
-The runtime includes KVM modules for Intel and AMD CPUs, the x86_64 QEMU system emulator, `qemu-img`, libvirt's QEMU, storage, and network drivers, `virtlogd`, `virtlockd`, and `virsh`. It does not install QEMU system emulators for other guest architectures. Package selection is in [`config/packages.txt`](config/packages.txt).
+The runtime includes KVM modules for Intel and AMD CPUs, the x86_64 QEMU system emulator, `qemu-img`, libvirt's QEMU, storage, and network drivers, `virtlogd`, `virtlockd`, and `virsh`. Ceph OSD, monitor, and manager daemons, their administration tools and OpenRC scripts, and QEMU's RBD backend are also included. It does not install QEMU system emulators for other guest architectures. Package selection is in [`config/packages.txt`](config/packages.txt).
 
 ## Build and test
 
@@ -325,7 +325,28 @@ qemu-img --version
 
 The embedded root filesystem is temporary. `/var/lib/libvirt/images` starts in RAM, and VM disks placed there disappear on reboot. Attach and mount durable storage before creating VM disks, then point a libvirt storage pool at that mount. Persist libvirt definitions and other configuration under `/etc/libvirt` if they must survive reboot. The sample injected config names `/vm-storage` as a mount point but does not identify a block device or filesystem. The agent reports an error and leaves a stopped guest stopped until that path is mounted.
 
+## Ceph storage runtime
+
+The base EFI includes Ceph 19 (Squid) OSD, monitor, and manager packages and their dependencies. `ceph`, `rbd`, `ceph-volume`, BlueStore tools, LVM, `dmsetup`, and the full `blkid`, `findmnt`, `lsblk`, and `wipefs` commands support administration and OSD activation. `qemu-block-rbd` lets QEMU and `qemu-img` access RBD images directly through librbd. Package selection uses the individual Ceph roles to avoid the full Ceph metapackage, optional dashboard, CephFS MDS, and RADOS Gateway.
+
+The generic image includes the Ceph OpenRC service scripts but leaves the daemons disabled. A deployment must supply the cluster configuration, credentials, node roles, and prepared storage before starting them. The current HCOS agent does not provision disks, activate OSDs, bootstrap monitors/managers, or restore libvirt Ceph secrets. The EFI does not contain a Ceph cluster configuration or keys.
+
+Keep monitor databases on a persistent local filesystem mounted at `/var/lib/ceph/mon` before starting monitors. BlueStore OSD data remains on its designated persistent block devices; existing OSDs must be activated after each live boot. QEMU can access RBD disks without a host `/vm-storage` mount. The current agent's `storage.path` mount check must be arranged separately (an empty path skips it); it does not check Ceph availability.
+
+`make verify` checks the Ceph tools and OpenRC scripts in the EFI, and the boot smoke tests exercise their version/help commands and QEMU RBD support. These checks do not form a Ceph cluster or validate replicated storage. From an enabled console, inspect the packaged tools with:
+
+```sh
+ceph-osd --version
+ceph-mon --version
+ceph-mgr --version
+ceph --version
+rbd --version
+ceph-volume --help
+```
+
 ## Hardware and image size
+
+A reference build with Alpine 3.24 and Ceph 19.2.4 produces a 134.3 MiB base EFI, about 44.8 MiB larger than the virtualization-only image. The current injected agent adds approximately 7 MiB. These are boot artifact sizes; Ceph runtime memory and persistent disk capacity are separate. Sizes change as Alpine packages and HCOS components change.
 
 [`config/modules.txt`](config/modules.txt) names the retained host kernel modules, including both x86 KVM variants, common wired NIC and storage drivers, bridge and TAP support. The build keeps their recursive dependencies and the netfilter module families needed by libvirt networking, then removes other modules. It also removes a duplicate kernel, package caches, documentation, locales, selected QEMU firmware files for unrelated platforms, and bundled libvirt daemons for other hypervisors. `linux-firmware-none` avoids Alpine's all-hardware firmware bundle; the package list adds Realtek NIC firmware.
 
